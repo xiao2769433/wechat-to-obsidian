@@ -38,13 +38,50 @@ wechat-to-obsidian/
 
 ## 安装
 
+本仓库有三种使用方式，按需选择。
+
+### 方式一：让 Claude Code 自动安装（推荐）
+
+若你的 Claude Code 版本支持从 Git 仓库一键安装插件 / 技能，直接执行安装命令即可，Claude Code 会自动加载 `SKILL.md`：
+
 ```bash
-git clone https://github.com/<你的用户名>/wechat-to-obsidian.git
-cd wechat-to-obsidian
-pip install -r requirements.txt
+帮我从这个 GitHub 仓库安装 skill：https://github.com/xiao2769433/wechat-to-obsidian
 ```
 
-也可作为 WorkBuddy 技能使用：把整个目录复制到 `~/.workbuddy/skills/wechat-to-obsidian/` 即可被 WorkBuddy 调用。
+### 方式二：手动安装（WorkBuddy / Claude Code）
+
+把仓库克隆到本地后，将目录复制到对应客户端的技能目录：
+
+```bash
+git clone https://github.com/xiao2769433/wechat-to-obsidian.git
+cd wechat-to-obsidian
+pip install -r requirements.txt
+
+# WorkBuddy（用户级）
+cp -r wechat-to-obsidian ~/.workbuddy/skills/wechat-to-obsidian
+
+# Claude Code（用户级，所有项目可用）
+cp -r wechat-to-obsidian ~/.claude/skills/wechat-to-obsidian
+
+# 或 Claude Code 项目级（仅当前项目）
+cp -r wechat-to-obsidian .claude/skills/wechat-to-obsidian
+```
+
+- **WorkBuddy**：在对话中给出文章链接并要求「保存到笔记 / 剪藏到 Obsidian」即可触发。
+- **Claude Code**：在对话中说「用 wechat-to-obsidian 把 `<链接>` 存到我的 Obsidian」即可触发（`SKILL.md` 的 `description` 已写好意图描述，便于自动匹配；首次运行会请求脚本执行权限）。
+
+### 方式三：本地使用（纯命令行）
+
+不想接入 AI 助手、只想在本地把文章转成 Markdown，直接运行脚本即可：
+
+```bash
+git clone https://github.com/xiao2769433/wechat-to-obsidian.git
+cd wechat-to-obsidian
+pip install -r requirements.txt
+python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
+```
+
+结果默认写入 `config/settings.json` 里 `vault` 配置的笔记库（或每次用 `--vault` / `--out` 指定）。
 
 ## 配置（config/settings.json）
 
@@ -75,6 +112,24 @@ pip install -r requirements.txt
 | `download_retries` | 单张图片下载失败重试次数 |
 
 ## 使用方法
+
+### 作为 Claude Code Skill 使用（推荐）
+
+在 Claude Code 中直接输入：
+
+```
+/wechat-to-obsidian https://mp.weixin.qq.com/s/xxxxx
+
+或者
+
+/wechat-to-obsidian https://mp.weixin.qq.com/s/xxxxx "本地指定目录"
+
+或者
+
+保存 https://mp.weixin.qq.com/s/xxxxx "本地指定目录"
+```
+
+### 作为本地命令行工具使用
 
 基本用法（结果保存到 `vault/wechat_folder/`）：
 
