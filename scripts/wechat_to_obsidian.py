@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+微信公众号文章 -> Obsidian 本地 Markdown（文章正文 + 图片本地化）
+
+改造自 GitHub likemaoke/wechat-article-to-md (MIT)，针对实际使用做了增强：
+  * 图片下载带微信 Referer，规避 403 空白图
+  * 处理协议相对地址 (//) 与 data: URI 占位图
+  * 解析 wx_fmt 得到正确图片扩展名（jpg/png/gif/webp）
+  * 图片文件名：xiao_yyyyMMdd_HHmmss_随机四位数字.<原格式>；不清空共享图片目录（安全）
+  * 默认相对 images/ 引用（适配 Obsidian 与用户笔记习惯）；--obsidian 用 ![[...]]
+  * 不写与文件名重复的 # 文档标题；正文标题逐级上移（h2→h1，h3→h2…）
+  * 自动添加 Obsidian 笔记属性（YAML frontmatter）：title/source/author([[...]])/created/description
+  * 自动压缩多余空行，输出更紧凑
+
+用法:
+  python wechat_to_obsidian.py <文章URL> [选项]
+  选项:
+    --vault DIR     笔记库根目录（覆盖 settings.json 的 vault；留空则需在 settings.json 配置或用 --out 指定）
+    --out DIR       直接指定 Markdown 输出目录（覆盖 --vault 下的默认目录）
+    --obsidian      使用 Obsidian wikilink 格式 ![[图片名]] 而非 !(images/x.jpg)
+    --no-img        不下载图片，仅保留原文图片链接
+"""
+
+import sys
+import re
+import json
+import time
+import random
+import string
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError as e:
+    print(f"缺少依赖库: {e}")
+    print("请先安装: pip install requests beautifulsoup4")
+    sys.exit(1)
+
+
+# 以下为「配置缺省值」，仅当 config/settings.json 缺失或某项缺失时兜底使用。
+# 实际运行取值全部来自 config/settings.json —— 改配置请改 json，不要改这里。
+WECHAT_FOLDER = "微信文章"
+IMAGE_PREFIX = "wechat"
+REQUEST_TIMEOUT = 30
+DOWNLOAD_RETRIES = 2
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+VALID_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+
+
+def load_settings():
+    """读取同目录 config/settings.json 作为运行时配置；缺失或异常时回退下方默认值。"""
+    cfg_path = Path(__file__).resolve().parent.parent / 'config' / 'settings.json'
+    defaults = {
+        'vault': "",
+        'wechat_folder': WECHAT_FOLDER,
+        'image_prefix': IMAGE_PREFIX,
+        'obsidian_wikilink': False,
+        'download_images': True,
+        'request_timeout': REQUEST_TIMEOUT,
+        'download_retries': DOWNLOAD_RETRIES,
+    }
+    try:
+        with open(cfg_path, encoding='utf-8') as f:
+            data = json.load(f)
+        for k in defaults:
+            if k in data:
+                defaults[k] = data[k]
+    except Exception:
+        pass
+    return defaults
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\r\n\t]', '_', name or '')
+    name = name.strip('. ')
+    return name or 'article'
+
+
+def normalize_img_url(url: str):
+    """清洗图片 URL：去掉占位 data: URI，补全协议相对地址。"""
+    if not url:
+        return None
+    url = url.strip()
+    if url.startswith('data:'):
+        return None
+    if url.startswith('//'):
+        url = 'https:' + url
+    if url.startswith('http'):
+        return url
+    return None
+
+
+def img_extension(url: str) -> str:
+    """从 wx_fmt 或路径后缀推断图片扩展名，默认 .jpg。"""
+    parsed = urlparse(url)
+    fmt = parse_qs(parsed.query).get('wx_fmt', [None])[0]
+    if fmt:
+        fmt = fmt.lower()
+        if fmt == 'jpeg':
+            return '.jpg'
+        if fmt in ('jpg', 'png', 'gif', 'webp', 'bmp'):
+            return '.' + fmt
+    ext = Path(parsed.path).suffix.lower()
+    if ext in VALID_EXTS:
+        return '.jpg' if ext == '.jpeg' else ext
+    return '.jpg'
+
+
+def download_image(url: str, img_dir: Path, filename: str) -> bool:
+    """带微信 Referer 下载图片，失败重试一次。"""
+    headers = {
+        'User-Agent': UA,
+        'Referer': 'https://mp.weixin.qq.com/',
+        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    }
+    for _ in range(DOWNLOAD_RETRIES):
+        try:
+            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200 and len(r.content) > 200:
+                (img_dir / filename).write_bytes(r.content)
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+def normalize_blanklines(text: str) -> str:
+    """压缩多余空行：连续空行合并为一行，去除每行行尾空白，去掉首尾空行。"""
+    lines = text.split('\n')
+    out = []
+    blank = False
+    for ln in lines:
+        s = ln.rstrip()
+        if s == '':
+            if not blank:
+                out.append('')
+                blank = True
+        else:
+            out.append(s)
+            blank = False
+    while out and out[0] == '':
+        out.pop(0)
+    while out and out[-1] == '':
+        out.pop()
+    return '\n'.join(out)
+
+
+def extract_publish_date(soup, html_text: str) -> str:
+    """尽量从页面提取发布日期（YYYY-MM-DD），失败则用当天。"""
+    m = soup.find('meta', attrs={'property': 'article:published_time'}) or \
+        soup.find('meta', attrs={'itemprop': 'datePublished'})
+    if m and m.get('content'):
+        return str(m.get('content'))[:10]
+    pt = soup.find(id='publish_time')
+    if pt and pt.get_text(strip=True):
+        return pt.get_text(strip=True)[:10]
+    mm = re.search(r'var\s+ct\s*=\s*["\']?(\d{10})', html_text or '')
+    if mm:
+        try:
+            return datetime.fromtimestamp(int(mm.group(1)), datetime.UTC).strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+def html_to_markdown(soup, img_dir, article_id, obsidian_mode, download_images):
+    """将正文 soup 转为 Markdown，保持元素原始顺序。"""
+    md = []
+    img_map = {}  # 原图 URL -> 本地文件名
+
+    if img_dir and download_images:
+        # 统一图片命名：xiao_yyyyMMdd_HHmmss_随机四位.<ext>
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        for img in soup.find_all('img'):
+            src = normalize_img_url(img.get('data-src') or img.get('src', ''))
+            if src and src not in img_map:
+                ext = img_extension(src)
+                rand4 = ''.join(random.choices(string.digits, k=4))
+                fname = f"{IMAGE_PREFIX}_{stamp}_{rand4}{ext}"
+                if download_image(src, img_dir, fname):
+                    img_map[src] = fname
+                    print(f"  图片已存: {fname}")
+                else:
+                    print(f"  图片下载失败: {src[:90]}")
+
+    def ref(fname: str) -> str:
+        return f"![[{fname}]]" if obsidian_mode else f"![](images/{fname})"
+
+    def add_img(src, alt=''):
+        url = normalize_img_url(src)
+        if url and url in img_map:
+            md.append(ref(img_map[url]) + "\n")
+        elif url:
+            md.append(f"![{alt}]({url})\n")
+
+    def inline(element) -> str:
+        parts = []
+        for child in element.children:
+            if hasattr(child, 'name') and child.name:
+                t = child.name
+
+                # 微信 LaTeX 公式：<span data-formula=" O(n) "> 由前端渲染成图，原文无文字
+                formula = child.get('data-formula')
+                if formula and formula.strip():
+                    parts.append('$' + formula.strip() + '$')
+                    continue
+
+                if t in ('b', 'strong'):
+                    txt = child.get_text(strip=True)
+                    if txt:
+                        parts.append(f"**{txt}**")
+                elif t in ('i', 'em'):
+                    txt = child.get_text(strip=True)
+                    if txt:
+                        parts.append(f"*{txt}*")
+                elif t == 'a':
+                    href = child.get('href', '')
+                    txt = child.get_text(strip=True)
+                    if txt:
+                        parts.append(f"[{txt}]({href})")
+                elif t == 'img':
+                    url = normalize_img_url(child.get('data-src') or child.get('src', ''))
+                    alt = child.get('alt', '')
+                    if url and url in img_map:
+                        parts.append(ref(img_map[url]))
+                    elif url:
+                        parts.append(f"![{alt}]({url})")
+                elif t == 'br':
+                    parts.append("\n")
+                else:
+                    r = inline(child)
+                    if r:
+                        parts.append(r)
+            else:
+                txt = str(child)
+                if txt:
+                    parts.append(txt)
+        return ''.join(parts)
+
+    def cell_inline(cell):
+        """把单元格内容渲染为单行 Markdown（图片/粗体/链接保留）。"""
+        parts = []
+        for child in cell.children:
+            if hasattr(child, 'name') and child.name:
+                tn = child.name
+
+                # 微信 LaTeX 公式：<span data-formula=" O(n) "> 由前端渲染成图，原文无文字
+                formula = child.get('data-formula')
+                if formula and formula.strip():
+                    parts.append('$' + formula.strip() + '$')
+                    continue
+
+                if tn in ('b', 'strong'):
+                    txt = child.get_text(strip=True)
+                    if txt:
+                        parts.append(f"**{txt}**")
+                elif tn in ('i', 'em'):
+                    txt = child.get_text(strip=True)
+                    if txt:
+                        parts.append(f"*{txt}*")
+                elif tn == 'a':
+                    href = child.get('href', '')
+                    txt = child.get_text(strip=True)
+                    if txt:
+                        parts.append(f"[{txt}]({href})")
+                elif tn == 'img':
+                    url = normalize_img_url(child.get('data-src') or child.get('src', ''))
+                    alt = child.get('alt', '')
+                    if url and url in img_map:
+                        parts.append(ref(img_map[url]))
+                    elif url:
+                        parts.append(f"![{alt}]({url})")
+                elif tn == 'br':
+                    parts.append(' ')
+                else:
+                    r = cell_inline(child)
+                    if r:
+                        parts.append(r)
+            else:
+                s = str(child)
+                if s:
+                    parts.append(s)
+        text = ''.join(parts)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text.replace('|', '\\|')
+
+    def table_to_markdown(table_el):
+        """把 <table> 转为 GFM Markdown 表格（首行作为表头，支持 colspan 展开）。"""
+        all_tr = table_el.find_all('tr')
+        if not all_tr:
+            return ''
+        grid = []
+        for tr in all_tr:
+            cells = tr.find_all(['td', 'th'])
+            row = []
+            for c in cells:
+                try:
+                    cs = int(c.get('colspan', 1))
+                except (ValueError, TypeError):
+                    cs = 1
+                row.append((cell_inline(c), cs))
+            if row:
+                grid.append(row)
+        if not grid:
+            return ''
+        ncols = max(sum(cs for _, cs in r) for r in grid)
+        out = []
+        for ri, row in enumerate(grid):
+            expanded = []
+            for content, cs in row:
+                expanded.append(content)
+                for _ in range(cs - 1):
+                    expanded.append('')
+            while len(expanded) < ncols:
+                expanded.append('')
+            out.append('| ' + ' | '.join(expanded) + ' |')
+            if ri == 0:
+                out.append('| ' + ' | '.join(['---'] * ncols) + ' |')
+        return '\n'.join(out)
+
+    def traverse(el, in_list=False, in_quote=False):
+        for child in el.children:
+            if not hasattr(child, 'name') or child.name is None:
+                txt = str(child).strip()
+                if txt and not in_list and not in_quote:
+                    md.append(txt + "\n\n")
+                continue
+            t = child.name
+            if t == 'img':
+                add_img(child.get('data-src') or child.get('src', ''), child.get('alt', ''))
+                continue
+            if t == 'iframe':
+                md.append("\n> 🎥 视频：微信视频无法在 Markdown 中直接播放，请访问原文观看。\n\n")
+                continue
+            if t in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+                level = max(1, int(t[1]) - 1)  # 文档标题已删除，正文标题逐级上移一级
+                text = child.get_text(strip=True)
+                for im in child.find_all('img'):
+                    a = im.get('alt', '')
+                    if a and a in text:
+                        text = text.replace(a, '')
+                text = text.strip()
+                if text:
+                    md.append(f"\n{'#' * level} {text}\n\n")
+                for im in child.find_all('img'):
+                    add_img(im.get('data-src') or im.get('src', ''), im.get('alt', ''))
+                continue
+            if t == 'p':
+                content = inline(child).strip()
+                if content:
+                    md.append(content + "\n\n")
+                continue
+            if t == 'ul':
+                items = [f"- {li.get_text(strip=True)}"
+                         for li in child.find_all('li', recursive=False)
+                         if li.get_text(strip=True)]
+                if items:
+                    md.append('\n'.join(items) + '\n')
+                continue
+            if t == 'ol':
+                items = [f"{i}. {li.get_text(strip=True)}"
+                         for i, li in enumerate(child.find_all('li', recursive=False), 1)
+                         if li.get_text(strip=True)]
+                if items:
+                    md.append('\n'.join(items) + '\n')
+                continue
+            if t == 'blockquote':
+                txt = child.get_text(strip=True)
+                if txt:
+                    md.append(f"\n> {txt}\n\n")
+                continue
+            if t == 'pre':
+                code = child.get_text()
+                if code:
+                    md.append(f"\n```\n{code}\n```\n\n")
+                continue
+            if t == 'hr':
+                md.append("\n---\n\n")
+                continue
+            if t == 'br':
+                md.append("\n")
+                continue
+            if t == 'table':
+                tbl = table_to_markdown(child)
+                if tbl:
+                    md.append("\n" + tbl + "\n\n")
+                continue
+            traverse(child, in_list, in_quote)
+
+    traverse(soup)
+    return '\n'.join(md)
+
+
+def fetch_wechat_article(url, vault="",
+                         obsidian_mode=False, out_dir=None, download_images=True):
+    headers = {
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    }
+    print(f"请求: {url}")
+    try:
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        r.encoding = 'utf-8'
+    except Exception as e:
+        print(f"请求失败: {e}")
+        return None
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    # 标题
+    meta = soup.find('meta', property='og:title')
+    if meta:
+        title = meta.get('content', '').strip() or '无标题'
+    else:
+        h = soup.find('h1', class_='rich_media_title')
+        title = h.get_text(strip=True) if h else '无标题'
+    print(f"标题: {title}")
+
+    # 作者
+    author = None
+    ae = soup.find(id='js_author_name')
+    if ae:
+        author = ae.get_text(strip=True)
+    if not author:
+        ae = soup.find('a', class_='rich_media_meta_link')
+        author = ae.get_text(strip=True) if ae else '未知作者'
+    print(f"作者: {author}")
+
+    # 正文
+    content = soup.find('div', class_='rich_media_content') or soup.find('div', id='js_content')
+    if not content:
+        print("未找到正文内容（该文章可能需登录或已删除）")
+        return None
+
+    base = Path(out_dir) if out_dir else (Path(vault) / WECHAT_FOLDER)
+    base.mkdir(parents=True, exist_ok=True)
+    img_dir = base / 'images'
+    if download_images:
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+    article_id = sanitize_filename(title)
+    pub_date = extract_publish_date(soup, r.text)
+
+    # 笔记属性（YAML frontmatter，格式见 templates/output-template.md）
+    safe_title = title.replace('"', '\\"')
+    frontmatter = (
+        "---\n"
+        f'title: "{safe_title}"\n'
+        f"source: {url}\n"
+        "author:\n"
+        f'  - "[[{author}]]"\n'
+        f"created: {pub_date}\n"
+        "description:\n"
+        "---\n"
+    )
+
+    body_md = html_to_markdown(content, img_dir if download_images else None,
+                               article_id, obsidian_mode, download_images)
+    body = normalize_blanklines(body_md)
+
+    out = frontmatter + "\n" + body + "\n"
+
+    fname = sanitize_filename(title) + '.md'
+    fpath = base / fname
+    i = 1
+    while fpath.exists():
+        fpath = base / f"{sanitize_filename(title)}_{i}.md"
+        i += 1
+    fpath.write_text(out, encoding='utf-8')
+    print(f"已保存: {fpath}")
+    if download_images:
+        print(f"图片目录: {(img_dir).resolve()}")
+    return str(fpath)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h', '--help'):
+        print(__doc__)
+        sys.exit(0)
+
+    url = args[0]
+    out_dir = None
+    obsidian_mode = False
+
+    # 运行时配置：优先 config/settings.json，可被命令行参数覆盖
+    settings = load_settings()
+    global WECHAT_FOLDER, IMAGE_PREFIX, REQUEST_TIMEOUT, DOWNLOAD_RETRIES
+    WECHAT_FOLDER = settings['wechat_folder']
+    IMAGE_PREFIX = settings['image_prefix']
+    REQUEST_TIMEOUT = settings['request_timeout']
+    DOWNLOAD_RETRIES = settings['download_retries']
+    if settings.get('obsidian_wikilink'):
+        obsidian_mode = True
+    download_images = settings.get('download_images', True)
+    vault = settings['vault']
+
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == '--vault' and i + 1 < len(args):
+            vault = args[i + 1]; i += 2; continue
+        if a == '--out' and i + 1 < len(args):
+            out_dir = args[i + 1]; i += 2; continue
+        if a == '--obsidian':
+            obsidian_mode = True; i += 1; continue
+        if a == '--no-img':
+            download_images = False; i += 1; continue
+        i += 1
+
+    if not vault and not out_dir:
+        print("错误：未配置笔记库根目录 vault。")
+        print("请在 config/settings.json 设置 \"vault\"，或用 --vault <目录> 指定，或用 --out <目录> 直接指定输出位置。")
+        sys.exit(1)
+
+    fetch_wechat_article(url, vault, obsidian_mode, out_dir, download_images)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,9 @@
+{
+  "vault": "",
+  "wechat_folder": "微信文章",
+  "image_prefix": "wechat",
+  "obsidian_wikilink": false,
+  "download_images": true,
+  "request_timeout": 30,
+  "download_retries": 2
+}
