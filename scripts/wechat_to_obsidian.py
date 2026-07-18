@@ -20,6 +20,7 @@
     --out DIR       直接指定 Markdown 输出目录（覆盖 --vault 下的默认目录）
     --obsidian      使用 Obsidian wikilink 格式 ![[图片名]] 而非 !(images/x.jpg)
     --no-img        不下载图片，仅保留原文图片链接
+    --overwrite     已存在同名文件时覆盖原文件，而非生成 _1.md 副本
 """
 
 import sys
@@ -34,12 +35,11 @@ from urllib.parse import urlparse, parse_qs
 
 try:
     import requests
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Comment
 except ImportError as e:
     print(f"缺少依赖库: {e}")
     print("请先安装: pip install requests beautifulsoup4")
     sys.exit(1)
-
 
 # 以下为「配置缺省值」，仅当 config/settings.json 缺失或某项缺失时兜底使用。
 # 实际运行取值全部来自 config/settings.json —— 改配置请改 json，不要改这里。
@@ -51,7 +51,6 @@ DOWNLOAD_RETRIES = 2
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 VALID_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
-
 
 def load_settings():
     """读取同目录 config/settings.json 作为运行时配置；缺失或异常时回退下方默认值。"""
@@ -75,12 +74,10 @@ def load_settings():
         pass
     return defaults
 
-
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\r\n\t]', '_', name or '')
     name = name.strip('. ')
     return name or 'article'
-
 
 def normalize_img_url(url: str):
     """清洗图片 URL：去掉占位 data: URI，补全协议相对地址。"""
@@ -94,7 +91,6 @@ def normalize_img_url(url: str):
     if url.startswith('http'):
         return url
     return None
-
 
 def img_extension(url: str) -> str:
     """从 wx_fmt 或路径后缀推断图片扩展名，默认 .jpg。"""
@@ -110,7 +106,6 @@ def img_extension(url: str) -> str:
     if ext in VALID_EXTS:
         return '.jpg' if ext == '.jpeg' else ext
     return '.jpg'
-
 
 def download_image(url: str, img_dir: Path, filename: str) -> bool:
     """带微信 Referer 下载图片，失败重试一次。"""
@@ -130,13 +125,23 @@ def download_image(url: str, img_dir: Path, filename: str) -> bool:
         time.sleep(1)
     return False
 
-
 def normalize_blanklines(text: str) -> str:
-    """压缩多余空行：连续空行合并为一行，去除每行行尾空白，去掉首尾空行。"""
+    """压缩正文多余空行：连续空行合并为一行，去除每行行尾空白，去掉首尾空行。
+    代码块（``` 围栏内）原样保留，不做任何处理，避免破坏代码换行/缩进。"""
     lines = text.split('\n')
     out = []
     blank = False
+    in_fence = False
     for ln in lines:
+        if ln.strip() == '```':
+            in_fence = not in_fence
+            out.append(ln)
+            blank = False
+            continue
+        if in_fence:
+            out.append(ln)
+            blank = False
+            continue
         s = ln.rstrip()
         if s == '':
             if not blank:
@@ -151,6 +156,50 @@ def normalize_blanklines(text: str) -> str:
         out.pop()
     return '\n'.join(out)
 
+def pre_to_text(pre_el) -> str:
+    """把 <pre> 转成保留原始换行的纯文本，去掉所有 HTML 标签。
+
+    - <br> 与块级元素 (p/section/div/li/h1-6/tr) 处换行
+    - 行内 span/code 文本原样保留（兼容微信高亮代码：span 之间若源码含 \\n 一并保留）
+    - 微信 LaTeX 公式 (<span data-formula="...">) 包成 $公式$
+    """
+    block_tags = {'p', 'section', 'div', 'li', 'tr',
+                  'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+    out = []
+
+    def walk(node):
+        if isinstance(node, Comment):
+            return
+        if isinstance(node, str):  # NavigableString
+            out.append(node)
+            return
+        name = node.name
+        if name is None:
+            return
+        # 微信 LaTeX 公式
+        formula = node.get('data-formula')
+        if formula and formula.strip():
+            out.append('$' + formula.strip() + '$')
+            return
+        if name == 'br':
+            out.append('\n')
+            return
+        if name in block_tags:
+            for c in node.children:
+                walk(c)
+            if not out or out[-1] != '\n':
+                out.append('\n')
+            return
+        # 其他元素（span/code/a/strong…）按内联递归，不补换行
+        for c in node.children:
+            walk(c)
+
+    walk(pre_el)
+    text = ''.join(out)
+    # 收敛多余连续空行（3 个及以上 → 2 个），首尾换行清理
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = text.strip('\n')
+    return text
 
 def extract_publish_date(soup, html_text: str) -> str:
     """尽量从页面提取发布日期（YYYY-MM-DD），失败则用当天。"""
@@ -169,11 +218,19 @@ def extract_publish_date(soup, html_text: str) -> str:
             pass
     return datetime.now().strftime('%Y-%m-%d')
 
-
 def html_to_markdown(soup, img_dir, article_id, obsidian_mode, download_images):
     """将正文 soup 转为 Markdown，保持元素原始顺序。"""
     md = []
     img_map = {}  # 原图 URL -> 本地文件名
+
+    # 图片复用：读取已保存的 URL->本地文件名 映射，避免重复下载同一文章的历史图片
+    map_path = (img_dir.parent / '.wechat_image_map.json') if img_dir else None
+    url_to_file = {}
+    if map_path and map_path.exists():
+        try:
+            url_to_file = json.loads(map_path.read_text(encoding='utf-8'))
+        except Exception:
+            url_to_file = {}
 
     if img_dir and download_images:
         # 统一图片命名：xiao_yyyyMMdd_HHmmss_随机四位.<ext>
@@ -181,14 +238,27 @@ def html_to_markdown(soup, img_dir, article_id, obsidian_mode, download_images):
         for img in soup.find_all('img'):
             src = normalize_img_url(img.get('data-src') or img.get('src', ''))
             if src and src not in img_map:
+                # 已存在且对应本地文件仍在 -> 直接复用，不重新下载
+                if src in url_to_file and (img_dir / url_to_file[src]).exists():
+                    img_map[src] = url_to_file[src]
+                    print(f"  图片复用: {url_to_file[src]}")
+                    continue
                 ext = img_extension(src)
                 rand4 = ''.join(random.choices(string.digits, k=4))
                 fname = f"{IMAGE_PREFIX}_{stamp}_{rand4}{ext}"
                 if download_image(src, img_dir, fname):
                     img_map[src] = fname
+                    url_to_file[src] = fname
                     print(f"  图片已存: {fname}")
                 else:
                     print(f"  图片下载失败: {src[:90]}")
+        # 回写映射（含本次新下载的），供下次复用
+        if map_path:
+            try:
+                map_path.write_text(json.dumps(url_to_file, ensure_ascii=False, indent=2),
+                                    encoding='utf-8')
+            except Exception:
+                pass
 
     def ref(fname: str) -> str:
         return f"![[{fname}]]" if obsidian_mode else f"![](images/{fname})"
@@ -377,7 +447,7 @@ def html_to_markdown(soup, img_dir, article_id, obsidian_mode, download_images):
                     md.append(f"\n> {txt}\n\n")
                 continue
             if t == 'pre':
-                code = child.get_text()
+                code = pre_to_text(child)
                 if code:
                     md.append(f"\n```\n{code}\n```\n\n")
                 continue
@@ -397,9 +467,9 @@ def html_to_markdown(soup, img_dir, article_id, obsidian_mode, download_images):
     traverse(soup)
     return '\n'.join(md)
 
-
 def fetch_wechat_article(url, vault="",
-                         obsidian_mode=False, out_dir=None, download_images=True):
+                         obsidian_mode=False, out_dir=None, download_images=True,
+                         overwrite=False):
     headers = {
         'User-Agent': UA,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -471,16 +541,16 @@ def fetch_wechat_article(url, vault="",
 
     fname = sanitize_filename(title) + '.md'
     fpath = base / fname
-    i = 1
-    while fpath.exists():
-        fpath = base / f"{sanitize_filename(title)}_{i}.md"
-        i += 1
+    if not overwrite:
+        i = 1
+        while fpath.exists():
+            fpath = base / f"{sanitize_filename(title)}_{i}.md"
+            i += 1
     fpath.write_text(out, encoding='utf-8')
     print(f"已保存: {fpath}")
     if download_images:
         print(f"图片目录: {(img_dir).resolve()}")
     return str(fpath)
-
 
 def main():
     args = sys.argv[1:]
@@ -491,6 +561,7 @@ def main():
     url = args[0]
     out_dir = None
     obsidian_mode = False
+    overwrite = False
 
     # 运行时配置：优先 config/settings.json，可被命令行参数覆盖
     settings = load_settings()
@@ -515,6 +586,8 @@ def main():
             obsidian_mode = True; i += 1; continue
         if a == '--no-img':
             download_images = False; i += 1; continue
+        if a == '--overwrite':
+            overwrite = True; i += 1; continue
         i += 1
 
     if not vault and not out_dir:
@@ -522,8 +595,7 @@ def main():
         print("请在 config/settings.json 设置 \"vault\"，或用 --vault <目录> 指定，或用 --out <目录> 直接指定输出位置。")
         sys.exit(1)
 
-    fetch_wechat_article(url, vault, obsidian_mode, out_dir, download_images)
-
+    fetch_wechat_article(url, vault, obsidian_mode, out_dir, download_images, overwrite)
 
 if __name__ == '__main__':
     main()
