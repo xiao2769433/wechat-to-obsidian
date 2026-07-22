@@ -18,9 +18,11 @@ wechat-to-obsidian/
 ├── templates/
 │   └── output-template.md    # 输出 Markdown 结构模板
 ├── config/
-│   └── settings.json         # 运行时配置（vault / folder / prefix / wikilink）
+│   ├── settings.example.json # 配置模板（复制为 settings.json 后填写）
+│   └── settings.json         # 运行时配置（已 gitignore，本地填写）
 ├── requirements.txt          # Python 依赖
-├── LICENSE.txt               # MIT 许可（含上游署名）
+├── LICENSE                   # MIT 许可（含上游署名）
+├── .gitignore
 └── docs/
     └── design.md             # 设计文档
 ```
@@ -78,7 +80,7 @@ wechat-to-obsidian/
 - 图片真实地址在 `data-src`（懒加载），`src` 多为占位图；脚本优先取 `data-src`。
 - 处理 `//` 协议相对地址与 `data:` 占位图；扩展名从 `wx_fmt` 参数或路径后缀推断。
 - 正文标题逐级上移（`h2→#`、`h3→##`…），不生成与文件名重复的 `#` 文档标题。
-- **笔记属性（frontmatter）**：自动写入 `title` / `source`(URL) / `author`(用 `[[作者]]` wikilink 列表) / `created`(尽量取页面发布日期，回退当天) / `description`(空)。格式见 `templates/output-template.md`。
+- **笔记属性（frontmatter）**：自动写入 `title` / `source`(URL) / `created`(尽量取页面发布日期，回退当天)。格式见 `templates/output-template.md`。
 - 自动压缩正文多余空行（连续空行合并为一行、去除行尾空白），列表渲染为紧凑形态。代码块（``` 围栏内）原样保留，不压缩换行/缩进；`<pre>` 经 `pre_to_text` 转换，保留原始换行并兼容微信高亮代码与 `<span data-formula>` 公式。
 - **表格**：`<table>` 转 GFM Markdown 表格（首行作表头，支持 colspan 展开，单元格内 `|` 自动转义）。
 - **公式**：微信用 `<span data-formula=" O(n) ">` 表示 LaTeX 公式（前端渲染成图，原文无文字无图），脚本抓取该属性并包成 `$公式$`（Obsidian/MathJax 可渲染）。

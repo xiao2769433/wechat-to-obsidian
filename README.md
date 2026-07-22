@@ -8,7 +8,7 @@
 
 - 抓取 `mp.weixin.qq.com` 文章正文，转换为干净的 Markdown
 - 图片本地化：自动下载到 `images/` 目录，带微信 `Referer` 规避 403，优先取懒加载地址 `data-src`
-- 自动写入 frontmatter：`title` / `source`(URL) / `author`(`[[作者]]`) / `created` / `description`
+- 自动写入 frontmatter：`title` / `source`(URL) / `created`
 - 标题逐级上移（`h2→#`、`h3→##`…），不生成与文件名重复的 `#` 文档标题
 - 表格转为 GitHub 风格 Markdown 表格；微信 LaTeX 公式（`<span data-formula>`）包裹为 `$公式$`，可在 Obsidian / MathJax 中渲染
 - 支持 Obsidian wikilink 图片格式（`![[图片名]]`，通过 `--obsidian` 或配置开启）
@@ -24,8 +24,11 @@ wechat-to-obsidian/
 ├── templates/
 │   └── output-template.md    # 输出 Markdown 结构模板
 ├── config/
-│   └── settings.json         # 运行时配置（vault / folder / prefix / wikilink）
+│   ├── settings.example.json # 配置模板（复制为 settings.json 后填写）
+│   └── settings.json         # 运行时配置（已 gitignore，本地填写）
 ├── requirements.txt          # Python 依赖
+├── LICENSE                   # MIT 许可（含上游署名）
+├── .gitignore
 ├── docs/
 │   └── design.md             # 设计文档
 └── README.md                 # 本文件
@@ -85,7 +88,13 @@ python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
 
 ## 配置（config/settings.json）
 
-首次使用前需填写你的笔记库路径（或每次用命令行参数指定）：
+`config/settings.json` 已加入 `.gitignore` 不会跟踪。首次使用前从模板复制并填写：
+
+```bash
+cp config/settings.example.json config/settings.json
+```
+
+然后填写你的笔记库路径（或每次用命令行参数指定）：
 
 ```json
 {
@@ -115,19 +124,13 @@ python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
 
 ### 作为 Claude Code Skill 使用（推荐）
 
-在 Claude Code 中直接输入：
+在 Claude Code 对话中给出链接并表达保存意图即可触发(由 `SKILL.md` 的 `description` 匹配，并非 slash 命令)：
 
 ```
-/wechat-to-obsidian https://mp.weixin.qq.com/s/xxxxx
-
-或者
-
-/wechat-to-obsidian https://mp.weixin.qq.com/s/xxxxx "本地指定目录"
-
-或者
-
-保存 https://mp.weixin.qq.com/s/xxxxx "本地指定目录"
+把这篇微信文章存到我的 Obsidian：https://mp.weixin.qq.com/s/xxxxx
 ```
+
+需要指定目录时，让 Claude 用 `--out <目录>` 或 `--vault <目录>` 参数运行脚本即可。
 
 ### 作为本地命令行工具使用
 
@@ -143,6 +146,8 @@ python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
 - `--vault DIR`：指定笔记库根目录（覆盖 `settings.json` 的 `vault`）
 - `--obsidian`：图片改用 Obsidian wikilink 格式 `![[图片名]]`
 - `--no-img`：不下载图片，仅保留原文图片链接
+- `--overwrite`：已存在同名文件时覆盖，而非生成 `_1.md` 副本
+- `--version`：显示版本号
 
 ## 输出示例
 
@@ -152,10 +157,7 @@ python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
 ---
 title: "文章标题"
 source: https://mp.weixin.qq.com/s/xxxxx
-author:
-  - "[[作者名]]"
 created: 2026-07-17
-description:
 ---
 
 # 正文首个一级标题

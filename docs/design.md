@@ -12,19 +12,25 @@ wechat-to-obsidian/
 ├── templates/
 │   └── output-template.md    # 输出 Markdown 结构模板
 ├── config/
-│   └── settings.json         # 运行时配置（vault/folder/prefix/wikilink）
+│   ├── settings.example.json # 配置模板
+│   └── settings.json         # 运行时配置（已 gitignore）
+├── requirements.txt          # Python 依赖
+├── LICENSE                   # MIT 许可
 └── docs/
     └── design.md             # 本文档
 ```
 
 ## 关键设计点
-- **图片下载**：带微信 `Referer` 规避 403；优先取懒加载地址 `data-src`；处理 `//` 协议相对与 `data:` 占位图；扩展名由 `wx_fmt`/路径推断，保留原格式。
+- **图片下载**：带微信 `Referer` 规避 403；优先取懒加载地址 `data-src`；处理 `//` 协议相对与 `data:` 占位图；扩展名由 `wx_fmt`/路径推断，保留原格式。`is_safe_url` 拦截内网/保留地址(SSRF 防护)，`looks_like_image` 按文件头校验。
+- **图片复用**：图片目录下 `.wechat_image_map.json` 记录 URL->本地文件名映射，同文章重复运行不重复下载；读取时过滤失效项，写入有上限。
 - **命名**：`{image_prefix}_yyyyMMdd_HHmmss_随机四位数字.{原扩展名}`，同一次抓取共用时间前缀，靠随机串去重；不清空共享 `images/` 目录。
+- **覆盖**：`--overwrite` 同名 `.md` 直接覆盖，否则生成 `_1.md`、`_2.md`… 副本。
 - **标题**：不写与文件名重复的 `# 文章标题`；正文标题逐级上移（`h2→h1`、`h3→h2`…）。
-- **属性**：frontmatter 含 `title` / `source` / `author`(`[[作者]]`) / `created`(优先页面发布日期 `var ct`/meta，回退当天) / `description`(空)。
+- **属性**：frontmatter 含 `title` / `source` / `created`(优先页面发布日期 `var ct`/meta，回退当天)。
 - **表格**：`<table>` → GFM Markdown（首行表头，colspan 展开，`|` 转义）。
 - **公式**：微信 `<span data-formula=" O(n) ">` → `$公式$`（Obsidian/MathJax 可渲染）。
-- **空行**：`normalize_blanklines()` 合并连续空行、去行尾空白；列表渲染为紧凑形态。
+- **代码块**：`<pre>` 经 `pre_to_text` 转纯文本(保留换行/缩进)；输出带语言标识，围栏长度按代码内反引号自适应(`fence_for`)。
+- **空行**：`normalize_blanklines()` 合并连续空行、去行尾空白；列表渲染为紧凑形态；代码块(```/~~~ 围栏，含带语言)内原样保留。
 - **配置**：所有可配置项集中在 `config/settings.json`，由 `load_settings()` 读取，缺失或异常时回退脚本内缺省值，命令行参数可覆盖。字段：
   - `vault` 笔记库根目录；`wechat_folder` 默认子目录（最终目录 = `vault/wechat_folder`）
   - `image_prefix` 图片名前缀；`obsidian_wikilink` 是否用 `![[...]]`

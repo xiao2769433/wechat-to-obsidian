@@ -1,10 +1,7 @@
 ---
 title: "<文章标题>"
 source: <文章原始 URL>
-author:
-  - "[[<作者名>]]"
 created: <发布日期 YYYY-MM-DD，取不到则用保存当天>
-description:
 ---
 
 # <正文首个一级标题（原文 h2 上移而来）>
