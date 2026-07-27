@@ -1,0 +1,4 @@
+# 可选依赖：安装后 HTML 解析更快、更严格。
+# 未安装时脚本自动回退到内置 html.parser，功能不受影响。
+# 单独安装： pip install -r requirements-optional.txt
+lxml>=4.6.0

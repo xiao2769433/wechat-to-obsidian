@@ -7,7 +7,7 @@
   * 图片下载带微信 Referer，规避 403 空白图
   * 处理协议相对地址 (//) 与 data: URI 占位图
   * 解析 wx_fmt 得到正确图片扩展名（jpg/png/gif/webp）
-  * 图片文件名：xiao_yyyyMMdd_HHmmss_随机四位数字.<原格式>；不清空共享图片目录（安全）
+  * 图片文件名：<prefix>_yyyyMMdd_HHmmss_随机四位数字.<原格式>；不清空共享图片目录（安全）
   * 默认相对 images/ 引用（适配 Obsidian 与用户笔记习惯）；--obsidian 用 ![[...]]
   * 不写与文件名重复的 # 文档标题；正文标题逐级上移（h2→h1，h3→h2…）
   * 自动添加 Obsidian 笔记属性（YAML frontmatter）：title/source/created
@@ -21,9 +21,15 @@
     --obsidian      使用 Obsidian wikilink 格式 ![[图片名]] 而非 !(images/x.jpg)
     --no-img        不下载图片，仅保留原文图片链接
     --overwrite     已存在同名文件时覆盖原文件，而非生成 _1.md 副本
+    --dry-run       只分析不下载/不写文件，打印预计结果（标题/日期/图片数）
 """
 
 import sys
+# Windows 默认 stdout 常为 GBK，会让中文汇总变乱码、迫使调用方额外 ls 验证；强制 UTF-8。
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 import re
 import argparse
 import json
@@ -31,7 +37,8 @@ import time
 import random
 import string
 import ipaddress
-from datetime import datetime
+import socket
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -43,6 +50,21 @@ except ImportError as e:
     print(f"缺少依赖库: {e}")
     print("请先安装: pip install requests beautifulsoup4")
     sys.exit(1)
+
+
+def _session():
+    """惰性创建并复用 requests.Session（避免导入期即依赖网络库）。
+
+    trust_env=False：不读取系统/env 代理，避免 Windows 残留的失效代理
+    （如已关闭的 Clash 7890）导致 SSLEOFError / ProxyError 直连失败。
+    若需走代理，请在系统层正确配置并保证代理可用，或改用支持代理的抓取方式。
+    """
+    if not hasattr(_session, '_inst'):
+        sess = requests.Session()
+        sess.trust_env = False
+        _session._inst = sess
+    return _session._inst
+
 
 # 以下为「配置缺省值」，仅当 config/settings.json 缺失或某项缺失时兜底使用。
 # 实际运行取值全部来自 config/settings.json —— 改配置请改 json，不要改这里。
@@ -56,9 +78,7 @@ __version__ = '0.1.0'
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-# 复用 HTTP 连接(P2)
-_session = requests.Session()
-# 优先 lxml 解析(更快)，未安装则回退 html.parser(P3)
+# 优先 lxml 解析(更快)，未安装则回退 html.parser
 try:
     import lxml  # noqa: F401
     _PARSER = 'lxml'
@@ -72,8 +92,12 @@ IMAGE_SIGNATURES = (b'\xff\xd8\xff', b'\x89PNG\r\n\x1a\n',
 MIN_IMAGE_BYTES = 200  # 图片最小字节数，过小视为无效(防 1x1 占位图)
 MAX_IMAGE_MAP = 2000  # 图片复用映射条目上限，超过则保留最近的一批
 
+
+# --------------------------------------------------------------------------- #
+# 配置与工具函数
+# --------------------------------------------------------------------------- #
 def load_settings():
-    """读取同目录 config/settings.json 作为运行时配置；缺失或异常时回退下方默认值。"""
+    """读取同目录 config/settings.json 作为运行时配置；缺失或异常时回退默认值（静默）。"""
     cfg_path = Path(__file__).resolve().parent.parent / 'config' / 'settings.json'
     defaults = {
         'vault': "",
@@ -90,18 +114,22 @@ def load_settings():
         for k in defaults:
             if k in data:
                 defaults[k] = data[k]
-    except Exception as e:
-        print(f"警告: 读取配置 {cfg_path} 失败({e})，使用默认配置。")
+    except Exception:
+        pass  # 静默回退默认配置
     return defaults
 
+
 def sanitize_filename(name: str) -> str:
+    """清洗文件名：去掉非法字符，去除首尾空白与小数点。"""
     name = re.sub(r'[<>:"/\\|?*\r\n\t]', '_', name or '')
     name = name.strip('. ')
     return name or 'article'
 
+
 def yaml_escape(s: str) -> str:
     """转义 YAML 双引号字符串中的反斜杠、双引号与换行，避免破坏 frontmatter。"""
     return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
+
 
 def normalize_img_url(url: str):
     """清洗图片 URL：去掉占位 data: URI，补全协议相对地址。"""
@@ -116,8 +144,32 @@ def normalize_img_url(url: str):
         return url
     return None
 
+
+# 常见云元数据 / 内网管理域名，直接拦截（无需 DNS 解析）
+_BLOCKED_HOSTNAMES = frozenset({
+    'metadata.google.internal',
+    'metadata.internal',
+    '169.254.169.254',
+})
+
+# 进程内 DNS 校验缓存：同一 host 只解析一次，避免一篇文章多张图重复 getaddrinfo。
+# 单进程生命周期内有效；DNS 变更导致的陈旧风险可接受（CLI 单次运行）。
+_safe_host_cache = {}
+
+
+def _is_ip_blocked(ip) -> bool:
+    """判断一个 ipaddress 对象是否命中内网/保留地址段。"""
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
 def is_safe_url(url: str) -> bool:
-    """防 SSRF：仅允许 http/https，且主机非 localhost/内网/保留地址(字面 IP 检查)。"""
+    """防 SSRF：仅允许 http/https，且主机非 localhost/内网/保留地址。
+
+    同时拦截字面 IP 与「解析后指向内网」的域名（含云元数据 169.254.169.254）。
+    DNS 解析失败时按不安全处理，避免放行无法验证的地址。
+    同一 host 的解析结果进程内缓存，避免多张图重复解析。
+    """
     try:
         parsed = urlparse(url)
     except Exception:
@@ -125,14 +177,40 @@ def is_safe_url(url: str) -> bool:
     if parsed.scheme not in ('http', 'https'):
         return False
     host = (parsed.hostname or '').lower()
-    if not host or host == 'localhost':
+    if not host or host == 'localhost' or host in _BLOCKED_HOSTNAMES:
         return False
+    # 字面 IP：直接判定
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return True  # 域名，放行(微信图床均为公网域名)
-    return not (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+        ip = None
+    if ip is not None:
+        return not _is_ip_blocked(ip)
+    # 域名：命中缓存直接返回，否则解析后逐个校验返回地址是否命中内网
+    if host in _safe_host_cache:
+        return _safe_host_cache[host]
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        _safe_host_cache[host] = False
+        return False  # 解析失败，保守拦截
+    if not infos:
+        _safe_host_cache[host] = False
+        return False
+    ok = True
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            ok = False
+            break
+        if _is_ip_blocked(ip):
+            ok = False
+            break
+    _safe_host_cache[host] = ok
+    return ok
+
 
 def looks_like_image(data: bytes) -> bool:
     """按文件头签名判断是否为常见图片，防恶意内容伪装成 .jpg。"""
@@ -142,9 +220,11 @@ def looks_like_image(data: bytes) -> bool:
         return True
     return data[:4] == b'RIFF' and data[8:12] == b'WEBP'
 
+
 def md_escape_url(url: str) -> str:
     """转义 Markdown 链接 url 中的空格与 )，避免破坏图片/链接语法。"""
     return url.replace(' ', '%20').replace(')', '%29')
+
 
 def img_extension(url: str) -> str:
     """从 wx_fmt 或路径后缀推断图片扩展名，默认 .jpg。"""
@@ -161,10 +241,13 @@ def img_extension(url: str) -> str:
         return '.jpg' if ext == '.jpeg' else ext
     return '.jpg'
 
+
 def download_image(url: str, img_dir: Path, filename: str, settings) -> bool:
-    """带微信 Referer 下载图片，失败按配置重试(指数退避，404 不重试)。"""
+    """带微信 Referer 下载图片，失败按配置重试(指数退避，404 不重试)。
+
+    不打印任何日志，仅返回是否成功，由调用方汇总。
+    """
     if not is_safe_url(url):
-        print(f"  跳过不安全图片地址(SSRF 防护): {url[:90]}")
         return False
     headers = {
         'User-Agent': UA,
@@ -173,17 +256,18 @@ def download_image(url: str, img_dir: Path, filename: str, settings) -> bool:
     }
     for attempt in range(1 + settings['download_retries']):
         try:
-            r = _session.get(url, headers=headers, timeout=settings['request_timeout'])
+            r = _session().get(url, headers=headers, timeout=settings['request_timeout'])
             if r.status_code == 200 and len(r.content) > MIN_IMAGE_BYTES and looks_like_image(r.content):
                 (img_dir / filename).write_bytes(r.content)
                 return True
             if r.status_code == 404:
                 return False  # 资源不存在，重试无意义
-        except Exception as e:
-            print(f"  图片下载异常: {e}")
+        except Exception:
+            pass
         if attempt < settings['download_retries']:
-            time.sleep(2 ** attempt)  # 指数退避: 1s, 2s, 4s...
+            time.sleep(2 ** attempt)  # 指数退避: 2^attempt 秒（1s, 2s, 4s…，共 download_retries 次）
     return False
+
 
 def normalize_blanklines(text: str) -> str:
     """压缩正文多余空行：连续空行合并为一行，去除每行行尾空白，去掉首尾空行。
@@ -216,6 +300,7 @@ def normalize_blanklines(text: str) -> str:
     while out and out[-1] == '':
         out.pop()
     return '\n'.join(out)
+
 
 def pre_to_text(pre_el) -> str:
     """把 <pre> 转成保留原始换行的纯文本，去掉所有 HTML 标签。
@@ -262,6 +347,7 @@ def pre_to_text(pre_el) -> str:
     text = text.strip('\n')
     return text
 
+
 def fence_for(code: str) -> str:
     """根据代码内最长反引号序列选择足够长的围栏(至少 3 个反引号)。"""
     max_run = run = 0
@@ -272,6 +358,7 @@ def fence_for(code: str) -> str:
         else:
             run = 0
     return '`' * max(3, max_run + 1)
+
 
 def code_language(pre_el) -> str:
     """尝试从 <pre>/<code> 的 class 提取语言标识(如 python)，取不到返回空串。"""
@@ -286,9 +373,13 @@ def code_language(pre_el) -> str:
                 return c[len(prefix):].strip()
     return ''
 
+
 def _render_inline(element, img_map, ref, br_sep):
     """渲染元素行内内容为 Markdown(粗体/斜体/链接/图片/公式/br)。
-    inline 与 cell_inline 的公共逻辑；br_sep 区分换行符，列表元素跳过(由 render_list 处理)。"""
+
+    inline 与 cell_inline 的公共逻辑；br_sep 区分换行符，列表元素跳过(由 render_list 处理)。
+    img_map 命中时输出本地引用 ref(fname)，否则保留原始 URL。
+    """
     parts = []
     for child in element.children:
         if hasattr(child, 'name') and child.name:
@@ -331,33 +422,52 @@ def _render_inline(element, img_map, ref, br_sep):
                 parts.append(txt)
     return ''.join(parts)
 
+
 def _table_to_markdown(table_el, cell_inline_fn):
-    """把 <table> 转为 GFM Markdown 表格(首行表头，colspan 展开)。"""
-    all_tr = table_el.find_all('tr')
-    if not all_tr:
+    """把 <table> 转为 GFM Markdown 表格（首行表头；支持 colspan / rowspan 展开）。
+
+    rowspan 通过在网格中留空单元格实现（GFM 无原生 rowspan，留空是通用写法）。
+    以 HTML 行号作为网格行号，rowspan 跨占的网格行已由被跨行本身提供，不额外新增行。
+    """
+    rows = table_el.find_all('tr')
+    if not rows:
         return ''
-    grid = []
-    for tr in all_tr:
-        cells = tr.find_all(['td', 'th'])
-        row = []
-        for c in cells:
+    grid = []  # grid[r][c] = 单元格内容；被跨行占用的格子填 ''
+    for ri, tr in enumerate(rows):
+        cells = [c for c in tr.find_all(['td', 'th'], recursive=False)]
+        if not cells:
+            continue
+        # 确保网格至少有 ri+1 行（上方 rowspan 可能已预建）
+        while len(grid) <= ri:
+            grid.append([])
+        r = ri
+        c = 0
+        for cell in cells:
+            # 跳过被上方 rowspan 占用的列
+            while c < len(grid[r]) and grid[r][c] is not None:
+                c += 1
             try:
-                cs = int(c.get('colspan', 1))
+                colspan = int(cell.get('colspan', 1) or 1)
             except (ValueError, TypeError):
-                cs = 1
-            row.append((cell_inline_fn(c), cs))
-        if row:
-            grid.append(row)
-    if not grid:
-        return ''
-    ncols = max(sum(cs for _, cs in r) for r in grid)
+                colspan = 1
+            try:
+                rowspan = int(cell.get('rowspan', 1) or 1)
+            except (ValueError, TypeError):
+                rowspan = 1
+            content = cell_inline_fn(cell)
+            for rr in range(r, r + rowspan):
+                while len(grid) <= rr:
+                    grid.append([])
+                rowref = grid[rr]
+                while len(rowref) < c + colspan:
+                    rowref.append(None)
+                for cc in range(c, c + colspan):
+                    rowref[cc] = content if (rr == r and cc == c) else ''
+            c += colspan
+    ncols = max((len(row) for row in grid), default=0)
     out = []
     for ri, row in enumerate(grid):
-        expanded = []
-        for content, cs in row:
-            expanded.append(content)
-            for _ in range(cs - 1):
-                expanded.append('')
+        expanded = [(x if x is not None else '') for x in row]
         while len(expanded) < ncols:
             expanded.append('')
         out.append('| ' + ' | '.join(expanded) + ' |')
@@ -365,8 +475,25 @@ def _table_to_markdown(table_el, cell_inline_fn):
             out.append('| ' + ' | '.join(['---'] * ncols) + ' |')
     return '\n'.join(out)
 
+
+def build_frontmatter(title: str, url: str, created: str) -> str:
+    """生成 Obsidian YAML frontmatter（title / source / created）。
+
+    title 与 source 均经 yaml_escape，避免含反斜杠/双引号/换行的值破坏 frontmatter。
+    """
+    safe_title = yaml_escape(title)
+    safe_url = yaml_escape(url)
+    return (
+        "---\n"
+        f'title: "{safe_title}"\n'
+        f"source: {safe_url}\n"
+        f"created: {created}\n"
+        "---\n"
+    )
+
+
 def extract_publish_date(soup, html_text: str) -> str:
-    """尽量从页面提取发布日期（YYYY-MM-DD），失败则用当天。"""
+    """尽量从页面提取发布日期（YYYY-MM-DD），失败则用当天（UTC）。"""
     m = soup.find('meta', attrs={'property': 'article:published_time'}) or \
         soup.find('meta', attrs={'itemprop': 'datePublished'})
     if m and m.get('content'):
@@ -374,116 +501,169 @@ def extract_publish_date(soup, html_text: str) -> str:
     pt = soup.find(id='publish_time')
     if pt and pt.get_text(strip=True):
         return pt.get_text(strip=True)[:10]
-    mm = re.search(r'var\s+ct\s*=\s*["\']?(\d{10})', html_text or '')
-    if mm:
-        try:
-            return datetime.fromtimestamp(int(mm.group(1)), datetime.UTC).strftime('%Y-%m-%d')
-        except Exception:
-            pass  # 时间戳解析失败，回退当天
-    return datetime.now().strftime('%Y-%m-%d')
-
-def html_to_markdown(soup, img_dir, obsidian_mode, download_images, settings):
-    """将正文 soup 转为 Markdown，保持元素原始顺序。"""
-    md = []
-    img_map = {}  # 原图 URL -> 本地文件名
-
-    # 图片复用：读取已保存的 URL->本地文件名 映射，避免重复下载同一文章的历史图片
-    map_path = (img_dir.parent / '.wechat_image_map.json') if img_dir else None
-    url_to_file = {}
-    if map_path and map_path.exists():
-        try:
-            raw = json.loads(map_path.read_text(encoding='utf-8'))
-            # 仅保留本地文件仍存在的映射，自动清理失效项
-            url_to_file = {u: f for u, f in raw.items()
-                           if (img_dir / f).exists()}
-        except Exception as e:
-            print(f"  警告: 图片复用映射读取失败({e})，将重新下载")
-            url_to_file = {}
-
-    if img_dir and download_images:
-        # 统一图片命名：xiao_yyyyMMdd_HHmmss_随机四位.<ext>
-        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        to_download = []  # (src, fname) 待并发下载
-        for img in soup.find_all('img'):
-            src = normalize_img_url(img.get('data-src') or img.get('src', ''))
-            if src and src not in img_map:
-                # 已存在且对应本地文件仍在 -> 直接复用，不重新下载
-                if src in url_to_file and (img_dir / url_to_file[src]).exists():
-                    img_map[src] = url_to_file[src]
-                    print(f"  图片复用: {url_to_file[src]}")
-                    continue
-                ext = img_extension(src)
-                rand4 = ''.join(random.choices(string.digits, k=4))
-                to_download.append((src, f"{settings['image_prefix']}_{stamp}_{rand4}{ext}"))
-        # 并发下载(P1)
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            results = list(ex.map(
-                lambda sf: (sf[0], sf[1], download_image(sf[0], img_dir, sf[1], settings)),
-                to_download))
-        for src, fname, ok in results:
-            if ok:
-                img_map[src] = fname
-                url_to_file[src] = fname
-                print(f"  图片已存: {fname}")
-            else:
-                print(f"  图片下载失败: {src[:90]}")
-        # 回写映射（含本次新下载的），供下次复用
-        if map_path:
+    # 多个候选时间戳字段（微信不同模板字段名不一）
+    for pattern in (r'var\s+ct\s*=\s*["\']?(\d{10})',
+                    r'var\s+oriCreateTime\s*=\s*["\']?(\d{10})',
+                    r'var\s+publish_time\s*=\s*["\']?(\d{10})',
+                    r'var\s+create_time\s*=\s*["\']?(\d{10})'):
+        mm = re.search(pattern, html_text or '')
+        if mm:
             try:
-                if len(url_to_file) > MAX_IMAGE_MAP:
-                    url_to_file = dict(list(url_to_file.items())[-MAX_IMAGE_MAP:])
-                map_path.write_text(json.dumps(url_to_file, ensure_ascii=False, indent=2),
-                                    encoding='utf-8')
-            except Exception as e:
-                print(f"  警告: 图片复用映射写入失败({e})")
+                return datetime.fromtimestamp(int(mm.group(1)), timezone.utc).strftime('%Y-%m-%d')
+            except Exception:
+                pass  # 时间戳解析失败，继续尝试下一个
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
-    def ref(fname: str) -> str:
-        return f"![[{fname}]]" if obsidian_mode else f"![](images/{fname})"
 
-    def add_img(src, alt=''):
+# --------------------------------------------------------------------------- #
+# 正文转换（核心）
+# --------------------------------------------------------------------------- #
+class WechatMarkdownConverter:
+    """把微信正文 soup 转为 Markdown，并完成图片本地化与计数。
+
+    设计要点：
+      * 图片下载在 convert() 内并发完成，成功/失败计数集中在 img_ok / img_fail；
+      * dry_run 模式只统计图片数量，不下载、不写盘；
+      * 不打印任何中间日志，结果由调用方统一汇总。
+    """
+
+    def __init__(self, base, img_dir, obsidian_mode, download_images, settings, dry_run=False):
+        self.base = Path(base)
+        self.img_dir = Path(img_dir) if img_dir else None
+        self.obsidian_mode = obsidian_mode
+        self.download_images = bool(download_images) and (self.img_dir is not None)
+        self.settings = settings
+        self.dry_run = dry_run
+        self.md = []
+        self.img_map = {}            # 原图 URL -> 本地文件名
+        self.url_to_file = {}        # 历史复用映射（从磁盘载入）
+        self.img_total = 0           # 文中图片总数（去重后）
+        self.img_ok = 0              # 下载/复用成功数
+        self.img_fail = 0            # 下载失败数
+        self.img_failed = []         # 失败的原图 URL 列表
+        if self.img_dir is not None:
+            self._load_reuse_map()
+
+    def _load_reuse_map(self):
+        """从 base/.wechat_image_map.json 载入历史图片映射（仅保留本地仍存在的项）。"""
+        map_path = self.base / '.wechat_image_map.json'
+        if map_path.exists():
+            try:
+                raw = json.loads(map_path.read_text(encoding='utf-8'))
+                self.url_to_file = {u: f for u, f in raw.items()
+                                    if (self.img_dir / f).exists()}
+            except Exception:
+                self.url_to_file = {}
+
+    def ref(self, fname: str) -> str:
+        """按模式返回图片引用：Obsidian wikilink 或相对 images/ 链接。"""
+        return f"![[{fname}]]" if self.obsidian_mode else f"![](images/{fname})"
+
+    def add_img(self, src, alt=''):
+        """追加一张图片引用；若已下载/复用则指向本地文件，否则保留原始 URL。"""
         url = normalize_img_url(src)
-        if url and url in img_map:
-            md.append(ref(img_map[url]) + "\n")
+        if url and url in self.img_map:
+            self.md.append(self.ref(self.img_map[url]) + "\n")
         elif url:
-            md.append(f"![{alt}]({md_escape_url(url)})\n")
+            self.md.append(f"![{alt}]({md_escape_url(url)})\n")
 
-    def inline(element) -> str:
-        return _render_inline(element, img_map, ref, '\n')
+    def render_inline(self, element, br_sep='\n'):
+        """渲染行内内容（默认换行符为 \\n）。"""
+        return _render_inline(element, self.img_map, self.ref, br_sep)
 
-    def render_list(list_el, ordered, depth=0):
+    def render_list(self, list_el, ordered, depth=0):
         """递归渲染列表(支持嵌套，子级缩进两空格)。"""
         lines = []
         for idx, li in enumerate(list_el.find_all('li', recursive=False), 1):
             marker = f"{'  ' * depth}{idx}. " if ordered else f"{'  ' * depth}- "
-            content = inline(li).strip()
+            content = self.render_inline(li).strip()
             if content:
                 lines.append(marker + content)
             for sub in li.find_all(['ul', 'ol'], recursive=False):
-                rendered = render_list(sub, sub.name == 'ol', depth + 1)
+                rendered = self.render_list(sub, sub.name == 'ol', depth + 1)
                 if rendered:
                     lines.append(rendered)
         return '\n'.join(lines)
 
-    def cell_inline(cell):
-        """把单元格内容渲染为单行 Markdown（图片/粗体/链接保留）。"""
-        text = _render_inline(cell, img_map, ref, ' ')
-        text = re.sub(r'\s+', ' ', text).strip()
+    def cell_inline(self, cell):
+        """把单元格内容渲染为单行 Markdown；单元格内 <br> 保留为 <br>（换行不丢失）。"""
+        text = _render_inline(cell, self.img_map, self.ref, '<br>')
+        text = re.sub(r'[ \t]+', ' ', text).strip()
         return text.replace('|', '\\|')
 
-    # 表格渲染见模块级 _table_to_markdown(通过 cell_inline 闭包参数化)
-    def traverse(el, in_list=False, in_quote=False):
+    def figure(self, node):
+        """处理 <figure>：渲染内嵌图片，figcaption 作为图注（斜体）。"""
+        img = node.find('img')
+        if img:
+            self.add_img(img.get('data-src') or img.get('src', ''), img.get('alt', ''))
+        cap = node.find('figcaption')
+        if cap:
+            txt = self.render_inline(cap).strip()
+            if txt:
+                self.md.append(f"*图：{txt}*\n\n")
+
+    def _collect_images(self, content):
+        """收集文中所有图片的原图 URL（去重，C5）。"""
+        srcs = []
+        seen = set()
+        for img in content.find_all('img'):
+            src = normalize_img_url(img.get('data-src') or img.get('src', ''))
+            if not src or src in seen:
+                continue
+            seen.add(src)
+            srcs.append(src)
+        return srcs
+
+    def _download_images(self, srcs):
+        """并发下载图片：命中复用映射的跳过下载，重复 URL 本次运行内只下载一次（C5）。"""
+        to_download = []
+        for src in srcs:
+            if src in self.url_to_file and (self.img_dir / self.url_to_file[src]).exists():
+                self.img_map[src] = self.url_to_file[src]
+                self.img_ok += 1
+                continue
+            ext = img_extension(src)
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            rand4 = ''.join(random.choices(string.digits, k=4))
+            fname = f"{self.settings['image_prefix']}_{stamp}_{rand4}{ext}"
+            to_download.append((src, fname))
+        if not to_download:
+            return
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(
+                lambda sf: (sf[0], sf[1], download_image(sf[0], self.img_dir, sf[1], self.settings)),
+                to_download))
+        for src, fname, ok in results:
+            if ok:
+                self.img_map[src] = fname
+                self.url_to_file[src] = fname
+                self.img_ok += 1
+            else:
+                self.img_fail += 1
+                self.img_failed.append(src)
+        # 回写映射（含本次新下载的），供下次复用
+        try:
+            if len(self.url_to_file) > MAX_IMAGE_MAP:
+                self.url_to_file = dict(list(self.url_to_file.items())[-MAX_IMAGE_MAP:])
+            (self.base / '.wechat_image_map.json').write_text(
+                json.dumps(self.url_to_file, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass  # 静默：映射写入失败不影响正文
+
+    def traverse(self, el):
+        """递归遍历正文节点，按类型追加对应的 Markdown 到 self.md。"""
         for child in el.children:
             if not hasattr(child, 'name') or child.name is None:
                 txt = str(child).strip()
-                if txt and not in_list and not in_quote:
-                    md.append(txt + "\n\n")
+                if txt:
+                    self.md.append(txt + "\n\n")
                 continue
             t = child.name
             if t == 'img':
-                add_img(child.get('data-src') or child.get('src', ''), child.get('alt', ''))
+                self.add_img(child.get('data-src') or child.get('src', ''), child.get('alt', ''))
                 continue
             if t == 'iframe':
-                md.append("\n> 🎥 视频：微信视频无法在 Markdown 中直接播放，请访问原文观看。\n\n")
+                self.md.append("\n> 🎥 视频：微信视频无法在 Markdown 中直接播放，请访问原文观看。\n\n")
                 continue
             if t in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
                 level = max(1, int(t[1]) - 1)  # 文档标题已删除，正文标题逐级上移一级
@@ -494,70 +674,113 @@ def html_to_markdown(soup, img_dir, obsidian_mode, download_images, settings):
                         text = text.replace(a, '')
                 text = text.strip()
                 if text:
-                    md.append(f"\n{'#' * level} {text}\n\n")
+                    self.md.append(f"\n{'#' * level} {text}\n\n")
                 for im in child.find_all('img'):
-                    add_img(im.get('data-src') or im.get('src', ''), im.get('alt', ''))
+                    self.add_img(im.get('data-src') or im.get('src', ''), im.get('alt', ''))
                 continue
             if t == 'p':
-                content = inline(child).strip()
+                content = self.render_inline(child).strip()
                 if content:
-                    md.append(content + "\n\n")
+                    self.md.append(content + "\n\n")
                 continue
             if t == 'ul':
-                rendered = render_list(child, ordered=False)
+                rendered = self.render_list(child, ordered=False)
                 if rendered:
-                    md.append(rendered + '\n')
+                    self.md.append(rendered + '\n')
                 continue
             if t == 'ol':
-                rendered = render_list(child, ordered=True)
+                rendered = self.render_list(child, ordered=True)
                 if rendered:
-                    md.append(rendered + '\n')
+                    self.md.append(rendered + '\n')
                 continue
             if t == 'blockquote':
-                txt = inline(child).strip()
+                txt = self.render_inline(child).strip()
                 if txt:
                     quoted = '\n'.join(f"> {ln}" for ln in txt.split('\n') if ln.strip())
-                    md.append(f"\n{quoted}\n\n")
+                    self.md.append(f"\n{quoted}\n\n")
                 continue
             if t == 'pre':
                 code = pre_to_text(child)
                 if code:
                     lang = code_language(child)
                     fence = fence_for(code)
-                    md.append(f"\n{fence}{lang}\n{code}\n{fence}\n\n")
+                    self.md.append(f"\n{fence}{lang}\n{code}\n{fence}\n\n")
                 continue
             if t == 'hr':
-                md.append("\n---\n\n")
+                self.md.append("\n---\n\n")
                 continue
             if t == 'br':
-                md.append("\n")
+                self.md.append("\n")
                 continue
             if t == 'table':
-                tbl = _table_to_markdown(child, cell_inline)
+                tbl = _table_to_markdown(child, self.cell_inline)
                 if tbl:
-                    md.append("\n" + tbl + "\n\n")
+                    self.md.append("\n" + tbl + "\n\n")
                 continue
-            traverse(child, in_list, in_quote)
+            if t == 'figure':
+                self.figure(child)
+                continue
+            # section/div/article/main/span/font 等容器：继续递归
+            self.traverse(child)
 
-    traverse(soup)
-    return '\n'.join(md)
+    def convert(self, content_node):
+        """执行转换：先并发下载图片（如需），再遍历生成 Markdown 正文。"""
+        self.md = []
+        srcs = self._collect_images(content_node)
+        self.img_total = len(srcs)
+        if self.download_images and not self.dry_run:
+            self._download_images(srcs)
+        self.traverse(content_node)
+        body = ''.join(self.md)
+        return normalize_blanklines(body)
 
-def fetch_wechat_article(url, settings, vault="",
-                         obsidian_mode=False, out_dir=None, download_images=True,
-                         overwrite=False):
+
+def html_to_markdown(soup, img_dir=None, obsidian_mode=False, download_images=False, settings=None):
+    """模块级便捷封装：直接把正文 soup 转为 Markdown（不下载图片时 img_dir 传 None）。
+
+    保留此函数以兼容旧调用方式与单测。
+    """
+    settings = settings or {'image_prefix': IMAGE_PREFIX,
+                            'request_timeout': REQUEST_TIMEOUT,
+                            'download_retries': DOWNLOAD_RETRIES}
+    base = Path(img_dir).parent if img_dir else Path('.')
+    conv = WechatMarkdownConverter(base=base, img_dir=img_dir,
+                                   obsidian_mode=obsidian_mode,
+                                   download_images=download_images,
+                                   settings=settings, dry_run=False)
+    return conv.convert(soup)
+
+
+# --------------------------------------------------------------------------- #
+# 抓取与落盘
+# --------------------------------------------------------------------------- #
+def is_wechat_url(url: str) -> bool:
+    """判断是否为微信公众号文章链接（用于抓取前的合法性提示）。"""
+    try:
+        host = urlparse(url).hostname or ''
+    except Exception:
+        return False
+    return (host == 'mp.weixin.qq.com'
+            or host.endswith('.mp.weixin.qq.com')
+            or host == 'weixin.qq.com')
+
+
+def _fetch_article(url, settings):
+    """抓取文章，返回 (soup, title, pub_date, content, error)。
+
+    不打印任何日志；出错时通过 error 字符串由调用方汇总。
+    """
     headers = {
         'User-Agent': UA,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
     }
-    print(f"请求: {url}")
     try:
-        r = _session.get(url, headers=headers, timeout=settings['request_timeout'])
+        r = _session().get(url, headers=headers, timeout=settings['request_timeout'])
         r.raise_for_status()
         r.encoding = 'utf-8'
     except Exception as e:
-        print(f"请求失败: {e}")
-        return None
+        return None, None, None, None, f'抓取失败：{e}'
 
     soup = BeautifulSoup(r.text, _PARSER)
 
@@ -568,50 +791,60 @@ def fetch_wechat_article(url, settings, vault="",
     else:
         h = soup.find('h1', class_='rich_media_title')
         title = h.get_text(strip=True) if h else '无标题'
-    print(f"标题: {title}")
 
-    # 作者
-    author = None
-    ae = soup.find(id='js_author_name')
-    if ae:
-        author = ae.get_text(strip=True)
-    if not author:
-        ae = soup.find('a', class_='rich_media_meta_link')
-        author = ae.get_text(strip=True) if ae else '未知作者'
-    print(f"作者: {author}")
-
-    # 正文
+    # 正文（C1: 不再提取/打印 author）
     content = soup.find('div', class_='rich_media_content') or soup.find('div', id='js_content')
     if not content:
-        print("未找到正文内容（该文章可能需登录或已删除）")
-        return None
+        return soup, title, None, None, '未找到正文内容（可能需登录或已删除）'
+
+    pub_date = extract_publish_date(soup, r.text)
+    return soup, title, pub_date, content, None
+
+
+def process_note(url, settings, vault='', obsidian_mode=False, out_dir=None,
+                 download_images=True, overwrite=False, dry_run=False):
+    """抓取并转换一篇文章，返回结果字典（含路径/图片计数/错误）。
+
+    该函数在成功/失败时都通过返回值携带信息，由 main 统一打印最终汇总。
+    """
+    result = {'error': None, 'path': None, 'img_ok': 0, 'img_fail': 0,
+              'img_failed': [], 'dry_run': dry_run, 'title': None,
+              'created': None, 'images': 0}
+
+    soup, title, pub_date, content, error = _fetch_article(url, settings)
+    result['title'] = title
+    result['created'] = pub_date
+    if error:
+        result['error'] = error
+        return result
 
     base = Path(out_dir) if out_dir else (Path(vault) / settings['wechat_folder'])
     try:
         base.mkdir(parents=True, exist_ok=True)
-        img_dir = base / 'images'
-        if download_images:
+        img_dir = base / 'images' if download_images else None
+        if img_dir is not None:
             img_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        print(f"错误: 无法创建输出目录 {base}({e})")
-        return None
+        result['error'] = f'无法创建输出目录 {base}：{e}'
+        return result
 
-    pub_date = extract_publish_date(soup, r.text)
+    conv = WechatMarkdownConverter(base=base, img_dir=img_dir,
+                                   obsidian_mode=obsidian_mode,
+                                   download_images=download_images,
+                                   settings=settings, dry_run=dry_run)
 
     # 笔记属性（YAML frontmatter，格式见 templates/output-template.md）
-    safe_title = yaml_escape(title)
-    frontmatter = (
-        "---\n"
-        f'title: "{safe_title}"\n'
-        f"source: {url}\n"
-        f"created: {pub_date}\n"
-        "---\n"
-    )
+    frontmatter = build_frontmatter(title, url, pub_date)
 
-    body_md = html_to_markdown(content, img_dir if download_images else None,
-                               obsidian_mode, download_images, settings)
-    body = normalize_blanklines(body_md)
+    if dry_run:
+        # 仍执行一次 convert 以统计图片（不下载）
+        conv.convert(content)
+        result['images'] = conv.img_total
+        return result
 
+    # convert() 内部已 normalize_blanklines；img_total 在 convert 后才确定
+    body = conv.convert(content)
+    result['images'] = conv.img_total
     out = frontmatter + "\n" + body + "\n"
 
     fname = sanitize_filename(title) + '.md'
@@ -621,11 +854,18 @@ def fetch_wechat_article(url, settings, vault="",
         while fpath.exists():
             fpath = base / f"{sanitize_filename(title)}_{i}.md"
             i += 1
-    fpath.write_text(out, encoding='utf-8')
-    print(f"已保存: {fpath}")
-    if download_images:
-        print(f"图片目录: {(img_dir).resolve()}")
-    return str(fpath)
+    try:
+        fpath.write_text(out, encoding='utf-8')
+    except OSError as e:
+        result['error'] = f'写入文件失败：{e}'
+        return result
+
+    result['path'] = str(fpath)
+    result['img_ok'] = conv.img_ok
+    result['img_fail'] = conv.img_fail
+    result['img_failed'] = conv.img_failed
+    return result
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -639,6 +879,7 @@ def main():
     parser.add_argument('--obsidian', action='store_true', help='图片改用 Obsidian wikilink ![[图片名]]')
     parser.add_argument('--no-img', action='store_true', help='不下载图片，仅保留原文图片链接')
     parser.add_argument('--overwrite', action='store_true', help='已存在同名文件时覆盖，而非生成 _1.md 副本')
+    parser.add_argument('--dry-run', action='store_true', help='只分析不下载/不写文件，打印预计结果')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     args = parser.parse_args()
 
@@ -658,9 +899,34 @@ def main():
         print("请在 config/settings.json 设置 \"vault\"，或用 --vault <目录> 指定，或用 --out <目录> 直接指定输出位置。")
         sys.exit(1)
 
-    result = fetch_wechat_article(args.url, settings, vault, obsidian_mode, out_dir, download_images, args.overwrite)
-    if not result:
+    if not is_wechat_url(args.url):
+        print(f"警告：链接非微信公众号域名（{args.url}），仍尝试抓取。")
+
+    result = process_note(args.url, settings, vault, obsidian_mode, out_dir,
+                          download_images, args.overwrite, args.dry_run)
+
+    # 最终汇总（脚本唯一打印位置）
+    if result.get('dry_run'):
+        print(f"【dry-run】标题：{result['title']}")
+        print(f"发布日期：{result['created']}")
+        print(f"预计图片：{result['images']} 张（未下载）")
+        return
+
+    if result['error']:
+        print(f"失败：{result['error']}")
         sys.exit(1)
+
+    print(f"已保存：{result['path']}")
+    if download_images:
+        print(f"图片：成功 {result['img_ok']} 张，失败 {result['img_fail']} 张")
+        max_show = 10  # 失败 URL 封顶，避免汇总过长占用上下文
+        for u in result['img_failed'][:max_show]:
+            print(f"  - 下载失败：{u[:90]}")
+        if len(result['img_failed']) > max_show:
+            print(f"  - …其余 {len(result['img_failed']) - max_show} 张略")
+    else:
+        print(f"图片：保留原文链接（共 {result['images']} 张）")
+
 
 if __name__ == '__main__':
     main()

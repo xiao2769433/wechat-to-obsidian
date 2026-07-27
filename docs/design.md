@@ -14,15 +14,20 @@ wechat-to-obsidian/
 ├── config/
 │   ├── settings.example.json # 配置模板
 │   └── settings.json         # 运行时配置（已 gitignore）
-├── requirements.txt          # Python 依赖
+├── requirements.txt          # Python 依赖（必装）
+├── requirements-optional.txt # 可选加速依赖（lxml，非必须）
+├── tests/
+│   └── test_wechat_to_obsidian.py # 单元测试
 ├── LICENSE                   # MIT 许可
-└── docs/
-    └── design.md             # 本文档
+├── .gitignore
+├── docs/
+│   └── design.md             # 本文档
+└── README.md                 # 说明文档
 ```
 
 ## 关键设计点
 - **图片下载**：带微信 `Referer` 规避 403；优先取懒加载地址 `data-src`；处理 `//` 协议相对与 `data:` 占位图；扩展名由 `wx_fmt`/路径推断，保留原格式。`is_safe_url` 拦截内网/保留地址(SSRF 防护)，`looks_like_image` 按文件头校验。
-- **图片复用**：图片目录下 `.wechat_image_map.json` 记录 URL->本地文件名映射，同文章重复运行不重复下载；读取时过滤失效项，写入有上限。
+- **图片复用**：文章目录下（与 `images/` 同级）`.wechat_image_map.json` 记录 URL->本地文件名映射，同文章重复运行不重复下载；读取时过滤失效项，写入有上限。
 - **命名**：`{image_prefix}_yyyyMMdd_HHmmss_随机四位数字.{原扩展名}`，同一次抓取共用时间前缀，靠随机串去重；不清空共享 `images/` 目录。
 - **覆盖**：`--overwrite` 同名 `.md` 直接覆盖，否则生成 `_1.md`、`_2.md`… 副本。
 - **标题**：不写与文件名重复的 `# 文章标题`；正文标题逐级上移（`h2→h1`、`h3→h2`…）。

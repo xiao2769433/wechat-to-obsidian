@@ -10,8 +10,10 @@
 - 图片本地化：自动下载到 `images/` 目录，带微信 `Referer` 规避 403，优先取懒加载地址 `data-src`
 - 自动写入 frontmatter：`title` / `source`(URL) / `created`
 - 标题逐级上移（`h2→#`、`h3→##`…），不生成与文件名重复的 `#` 文档标题
-- 表格转为 GitHub 风格 Markdown 表格；微信 LaTeX 公式（`<span data-formula>`）包裹为 `$公式$`，可在 Obsidian / MathJax 中渲染
+- 表格转为 GitHub 风格 Markdown 表格（支持 `colspan` / `rowspan` 展开，单元格内 `<br>` 换行保留，单元格内 `|` 自动转义）；`<figure>` / `<figcaption>` 渲染为图片 + 图注
+- 微信 LaTeX 公式（`<span data-formula>`）包裹为 `$公式$`，可在 Obsidian / MathJax 中渲染
 - 支持 Obsidian wikilink 图片格式（`![[图片名]]`，通过 `--obsidian` 或配置开启）
+- 支持 `--dry-run` 预检（只分析不下载/不写文件，打印预计标题/日期/图片数）；非微信域名链接会给出提示
 - 自动压缩多余空行、列表渲染为紧凑形态，输出整洁
 
 ## 目录结构
@@ -26,18 +28,22 @@ wechat-to-obsidian/
 ├── config/
 │   ├── settings.example.json # 配置模板（复制为 settings.json 后填写）
 │   └── settings.json         # 运行时配置（已 gitignore，本地填写）
-├── requirements.txt          # Python 依赖
+├── requirements.txt          # Python 依赖（必装）
+├── requirements-optional.txt  # 可选加速依赖（lxml，非必须）
 ├── LICENSE                   # MIT 许可（含上游署名）
 ├── .gitignore
 ├── docs/
 │   └── design.md             # 设计文档
+├── tests/
+│   └── test_wechat_to_obsidian.py # 单元测试
 └── README.md                 # 本文件
 ```
 
 ## 环境要求
 
 - Python 3.8 及以上
-- 依赖：`requests`、`beautifulsoup4`
+- 必装依赖：`requests`、`beautifulsoup4`（`pip install -r requirements.txt`）
+- 可选加速：`lxml`（`pip install -r requirements-optional.txt`）；未安装时脚本自动回退内置 `html.parser`，功能不受影响
 
 ## 安装
 
@@ -147,6 +153,7 @@ python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
 - `--obsidian`：图片改用 Obsidian wikilink 格式 `![[图片名]]`
 - `--no-img`：不下载图片，仅保留原文图片链接
 - `--overwrite`：已存在同名文件时覆盖，而非生成 `_1.md` 副本
+- `--dry-run`：只分析不下载/不写文件，打印预计标题/日期/图片数
 - `--version`：显示版本号
 
 ## 输出示例
@@ -172,13 +179,14 @@ created: 2026-07-17
 - 微信**视频**无法直接下载，脚本会在原位置插入提示，引导去原文观看。
 - 部分公众号文章有访问限制 / 需登录，可能抓不到正文（脚本会提示「未找到正文内容」）。
 - 个别图片链接已失效或被防盗链，下载会失败，属正常现象；图片文件名保留原格式，不会清空已有 `images/` 目录，可放心重复运行。
+- 安全：`is_safe_url` 仅放行 http/https，并拦截 localhost / 内网 IP（字面与域名解析后指向内网均拦截），以及云元数据域名（`metadata.google.internal`、`169.254.169.254`）；DNS 解析失败时保守拦截。
 
 ## 技术要点
 
 - 图片真实地址在 `data-src`（懒加载），`src` 多为占位图；脚本优先取 `data-src`。
 - 处理 `//` 协议相对地址与 `data:` 占位图；扩展名从 `wx_fmt` 参数或路径后缀推断，保留原图格式。
 - 正文标题逐级上移（`h2→#`、`h3→##`…），不生成与文件名重复的 `#` 文档标题。
-- 表格转为 GFM Markdown（首行作表头，支持 colspan 展开，单元格内 `|` 自动转义）。
+- 表格转为 GFM Markdown（首行作表头，支持 `colspan` / `rowspan` 展开，单元格内 `<br>` 换行保留，单元格内 `|` 自动转义）；`<figure>` 渲染为图片，`<figcaption>` 渲染为斜体图注。
 
 ## License
 
