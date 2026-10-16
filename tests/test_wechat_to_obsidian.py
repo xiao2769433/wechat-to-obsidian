@@ -13,6 +13,7 @@
 import re
 import os
 import sys
+import json as json_mod
 import socket
 import unittest
 import tempfile
@@ -417,6 +418,388 @@ class TestConverterDownload(unittest.TestCase):
         self.assertTrue(w.is_wechat_url('https://mp.weixin.qq.com/s/abc?x=1'))
         self.assertFalse(w.is_wechat_url('https://example.com/x'))
         self.assertFalse(w.is_wechat_url('not a url'))
+
+
+class TestAlbumParsing(unittest.TestCase):
+    """合集 URL / album_id 解析（F1：--album 支持两种入参）。"""
+
+    def test_parse_full_album_url(self):
+        url = ('https://mp.weixin.qq.com/mp/appmsgalbum?__biz=Mzg4NDkzNTU1Ng=='
+               '&action=getalbum&album_id=4511205931589779463&scene=126&sessionid=#wechat_redirect')
+        biz, album = w.parse_album_target(url)
+        self.assertEqual(biz, 'Mzg4NDkzNTU1Ng==')
+        self.assertEqual(album, '4511205931589779463')
+
+    def test_parse_bare_album_id_with_biz(self):
+        biz, album = w.parse_album_target('4511205931589779463', biz='Mzg4NDkzNTU1Ng==')
+        self.assertEqual(biz, 'Mzg4NDkzNTU1Ng==')
+        self.assertEqual(album, '4511205931589779463')
+
+    def test_parse_bare_album_id_without_biz(self):
+        biz, album = w.parse_album_target('4511205931589779463')
+        self.assertEqual(biz, '')
+        self.assertEqual(album, '4511205931589779463')
+
+    def test_parse_empty(self):
+        self.assertEqual(w.parse_album_target(''), ('', ''))
+        self.assertEqual(w.parse_album_target(None), ('', ''))
+
+    def test_parse_album_url_without_album_id(self):
+        biz, album = w.parse_album_target('https://mp.weixin.qq.com/mp/appmsgalbum?__biz=ABC')
+        self.assertEqual(biz, 'ABC')
+        self.assertEqual(album, '')
+
+
+class TestAlbumApiUrl(unittest.TestCase):
+    """合集接口 URL 构造（F2：游标参数名不可改）。"""
+
+    def test_first_page_url(self):
+        u = w._album_api_url('BIZ', 'ALBUM')
+        self.assertIn('action=getalbum', u)
+        self.assertIn('__biz=BIZ', u)
+        self.assertIn('album_id=ALBUM', u)
+        self.assertIn('count=10', u)
+        self.assertIn('f=json', u)          # 缺 f=json 会返回 HTML
+        self.assertNotIn('begin_msgid', u)  # 首页无游标
+
+    def test_next_page_uses_cursor(self):
+        u = w._album_api_url('BIZ', 'ALBUM', begin=('2247485639', '1'))
+        self.assertIn('begin_msgid=2247485639', u)
+        self.assertIn('begin_itemidx=1', u)
+
+    def test_custom_count(self):
+        self.assertIn('count=3', w._album_api_url('B', 'A', count=3))
+
+    def test_ignores_legacy_pageidx(self):
+        """回归：pageidx/from_msgid 实测无效，URL 中不应出现。"""
+        u = w._album_api_url('BIZ', 'ALBUM')
+        self.assertNotIn('pageidx', u)
+        self.assertNotIn('from_msgid', u)
+
+
+@skip_no_deps
+class TestFetchAlbumItems(unittest.TestCase):
+    """合集游标翻页（F2），全部用 mock，不联网。"""
+
+    def _page(self, items, continue_flag='1'):
+        return json_mod.dumps({
+            'base_resp': {'ret': 0},
+            'getalbum_resp': {
+                'article_list': items,
+                'continue_flag': continue_flag,
+                'base_info': {'title': '图解计算机原理'},
+            },
+        })
+
+    @staticmethod
+    def _item(mid, title):
+        return {'title': title, 'msgid': mid, 'itemidx': '1',
+                'url': f'http://mp.weixin.qq.com/s?mid={mid}'}
+
+    def _session_for(self, pages):
+        """按请求顺序依次返回 pages；记录每次请求的 URL 供断言。"""
+        calls = []
+
+        class Resp:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.content = b''
+                self.encoding = None
+
+            def raise_for_status(self):
+                pass
+
+        class Sess:
+            def get(self, url, **k):
+                calls.append(url)
+                idx = min(len(calls) - 1, len(pages) - 1)
+                return Resp(pages[idx])
+
+        return Sess(), calls
+
+    def test_paginates_until_continue_flag_zero(self):
+        pages = [
+            self._page([self._item('100', 'A'), self._item('101', 'B')], '1'),
+            self._page([self._item('102', 'C')], '0'),
+        ]
+        sess, calls = self._session_for(pages)
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: sess):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.fetch_album_items('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM', settings)
+        self.assertIsNone(r['error'])
+        self.assertEqual(len(r['items']), 3)
+        self.assertEqual(r['album_title'], '图解计算机原理')
+        self.assertEqual([i['title'] for i in r['items']], ['A', 'B', 'C'])
+        self.assertEqual(r['items'][0]['n'], 1)
+        self.assertEqual(r['items'][2]['n'], 3)
+        # 第 2 次请求必须带游标（上一页最后一条）
+        self.assertEqual(len(calls), 2)
+        self.assertIn('begin_msgid=101', calls[1])
+
+    def test_stops_when_no_new_items(self):
+        """接口重复返回同一页时应立即停止，避免死循环。"""
+        same = self._page([self._item('100', 'A')], '1')
+        sess, calls = self._session_for([same])
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: sess):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.fetch_album_items('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM', settings)
+        self.assertEqual(len(r['items']), 1)
+        self.assertLess(len(calls), w.ALBUM_MAX_PAGES)
+
+    def test_dedupes_by_msgid_and_itemidx(self):
+        pages = [
+            self._page([self._item('100', 'A'), self._item('101', 'B')], '1'),
+            self._page([self._item('101', 'B'), self._item('102', 'C')], '0'),
+        ]
+        sess, _ = self._session_for(pages)
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: sess):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.fetch_album_items('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM', settings)
+        self.assertEqual([i['title'] for i in r['items']], ['A', 'B', 'C'])
+
+    def test_missing_biz_reports_error(self):
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        r = w.fetch_album_items('4511205931589779463', settings)
+        self.assertIsNotNone(r['error'])
+        self.assertIn('__biz', r['error'])
+        self.assertEqual(r['items'], [])
+
+    def test_missing_album_id_reports_error(self):
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        r = w.fetch_album_items('', settings, biz='BIZ')
+        self.assertIsNotNone(r['error'])
+        self.assertIn('album_id', r['error'])
+
+    def test_first_page_failure_reports_error(self):
+        class Sess:
+            def get(self, *a, **k):
+                raise RuntimeError('network down')
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: Sess()):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.fetch_album_items('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM', settings)
+        self.assertIsNotNone(r['error'])
+        self.assertEqual(r['items'], [])
+
+    def test_html_response_treated_as_failure(self):
+        """接口未带 f=json 时返回 HTML，应报错而非崩溃/静默空结果。"""
+        class Resp:
+            status_code = 200
+            text = '<html><body>验证</body></html>'
+            content = b''
+
+            def raise_for_status(self):
+                pass
+
+        class Sess:
+            def get(self, *a, **k):
+                return Resp()
+
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: Sess()):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.fetch_album_items('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM', settings)
+        self.assertIsNotNone(r['error'])
+
+    def test_url_html_entities_unescaped(self):
+        """接口返回的 &amp; 应还原为 &。"""
+        item = {'title': 'A', 'msgid': '1', 'itemidx': '1',
+                'url': 'http://mp.weixin.qq.com/s?__biz=B&amp;mid=1'}
+        pages = [self._page([item], '0')]
+        sess, _ = self._session_for(pages)
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: sess):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.fetch_album_items('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM', settings)
+        self.assertNotIn('&amp;', r['items'][0]['url'])
+        self.assertIn('&mid=1', r['items'][0]['url'])
+
+    def test_single_object_article_list(self):
+        """接口单条时可能返回对象而非数组，需兼容。"""
+        single = json_mod.dumps({
+            'base_resp': {'ret': 0},
+            'getalbum_resp': {
+                'article_list': self._item('100', 'Only'),
+                'continue_flag': '0',
+                'base_info': {'title': 'T'},
+            },
+        })
+        sess, _ = self._session_for([single])
+        settings = {'request_timeout': 30, 'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: sess):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.fetch_album_items('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM', settings)
+        self.assertIsNone(r['error'])
+        self.assertEqual(len(r['items']), 1)
+
+
+@skip_no_deps
+class TestProcessAlbum(unittest.TestCase):
+    """合集批量落盘（F3）：串联 fetch_album_items 与 process_note。"""
+
+    ART_HTML = (
+        '<html><head><meta property="og:title" content="{title}"></head>'
+        '<body><div class="rich_media_content"><p>{title} 正文</p>'
+        '</div></body></html>'
+    )
+
+    def _sessions(self, pages):
+        """按顺序返回合集 JSON 页 + 文章 HTML。"""
+        album_txt = json_mod.dumps({
+            'base_resp': {'ret': 0},
+            'getalbum_resp': {'article_list': pages, 'continue_flag': '0',
+                              'base_info': {'title': '测试合集'}},
+        })
+
+        class Resp:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.content = b''
+                self.encoding = None
+
+            def raise_for_status(self):
+                pass
+
+        class Sess:
+            def get(self, url, **k):
+                if 'action=getalbum' in url:
+                    return Resp(album_txt)
+                # 文章抓取：按 URL 里的 mid 造标题
+                mm = re.search(r'mid=(\d+)', url)
+                return Resp(self_outer.ART_HTML.format(title=f'T{mm.group(1)}'))
+
+        self_outer = self
+        return Sess()
+
+    def test_writes_all_articles_and_index(self):
+        pages = [{'title': f'T{i}', 'msgid': str(i), 'itemidx': '1',
+                  'url': f'http://mp.weixin.qq.com/s?__biz=B&mid={i}'}
+                 for i in (11, 12, 13)]
+        settings = {'image_prefix': 'wechat', 'request_timeout': 30,
+                    'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: self._sessions(pages)):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                with tempfile.TemporaryDirectory() as d:
+                    r = w.process_album('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM',
+                                        settings, vault='', out_dir=d,
+                                        download_images=False, progress=False)
+                    self.assertIsNone(r['error'])
+                    self.assertEqual(r['total'], 3)
+                    self.assertEqual(len(r['ok']), 3)
+                    self.assertEqual(r['fail'], [])
+                    # 每篇 md 均落盘（须在临时目录存活期间断言）
+                    for o in r['ok']:
+                        self.assertTrue(Path(o['path']).exists(), o['path'])
+                    # 链接清单已生成且含 3 条 wikilink
+                    self.assertIsNotNone(r['index_path'])
+                    idx = Path(r['index_path']).read_text(encoding='utf-8')
+                    self.assertEqual(idx.count('[['), 3)
+
+    def test_partial_failure_kept_and_reported(self):
+        """单篇失败不应中断整本；成功项保留、失败项入 fail。"""
+        pages = [{'title': 'OK', 'msgid': '1', 'itemidx': '1',
+                  'url': 'http://mp.weixin.qq.com/s?__biz=B&mid=1'},
+                 {'title': 'BAD', 'msgid': '2', 'itemidx': '1',
+                  'url': 'http://mp.weixin.qq.com/s?__biz=B&mid=2'}]
+        album_txt = json_mod.dumps({
+            'base_resp': {'ret': 0},
+            'getalbum_resp': {'article_list': pages, 'continue_flag': '0',
+                              'base_info': {'title': 'C'}},
+        })
+
+        class Resp:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.content = b''
+                self.encoding = None
+
+            def raise_for_status(self):
+                pass
+
+        class Sess:
+            def get(self, url, **k):
+                if 'action=getalbum' in url:
+                    return Resp(album_txt)
+                if 'mid=2' in url:
+                    return Resp('<html><body>无正文</body></html>')  # 触发失败
+                return Resp('<html><head><meta property="og:title" content="OK">'
+                            '</head><body><div class="rich_media_content">'
+                            '<p>x</p></div></body></html>')
+
+        settings = {'image_prefix': 'wechat', 'request_timeout': 30,
+                    'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: Sess()):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                with tempfile.TemporaryDirectory() as d:
+                    r = w.process_album('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM',
+                                        settings, vault='', out_dir=d,
+                                        download_images=False, progress=False)
+        self.assertIsNone(r['error'])
+        self.assertEqual(len(r['ok']), 1)
+        self.assertEqual(len(r['fail']), 1)
+        self.assertEqual(r['fail'][0]['title'], 'BAD')
+
+    def test_empty_album_reports_error(self):
+        album_txt = json_mod.dumps({
+            'base_resp': {'ret': 0},
+            'getalbum_resp': {'article_list': [], 'continue_flag': '0',
+                              'base_info': {'title': '空'}},
+        })
+
+        class Resp:
+            status_code = 200
+            text = album_txt
+            content = b''
+
+            def raise_for_status(self):
+                pass
+
+        class Sess:
+            def get(self, *a, **k):
+                return Resp()
+
+        settings = {'image_prefix': 'wechat', 'request_timeout': 30,
+                    'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: Sess()):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                r = w.process_album('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                    '?__biz=BIZ&album_id=ALBUM', settings,
+                                    vault='', out_dir='/tmp', progress=False)
+        self.assertIsNotNone(r['error'])
+        self.assertEqual(r['ok'], [])
+
+    def test_dry_run_writes_nothing(self):
+        pages = [{'title': 'A', 'msgid': '1', 'itemidx': '1',
+                  'url': 'http://mp.weixin.qq.com/s?__biz=B&mid=1'}]
+        settings = {'image_prefix': 'wechat', 'request_timeout': 30,
+                    'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: self._sessions(pages)):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                with tempfile.TemporaryDirectory() as d:
+                    r = w.process_album('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM',
+                                        settings, vault='', out_dir=d,
+                                        download_images=False, dry_run=True,
+                                        progress=False)
+        self.assertEqual(len(r['ok']), 1)
+        self.assertIsNone(r['ok'][0]['path'])       # dry-run 不落盘
+        self.assertIsNone(r['index_path'])          # 不生成清单
+        self.assertEqual(list(Path(d).glob('*.md')), [])
 
 
 @skip_no_deps

@@ -15,6 +15,7 @@
 
 用法:
   python wechat_to_obsidian.py <文章URL> [选项]
+  python wechat_to_obsidian.py --album <合集URL或album_id> [选项]
   选项:
     --vault DIR     笔记库根目录（覆盖 settings.json 的 vault；留空则需在 settings.json 配置或用 --out 指定）
     --out DIR       直接指定 Markdown 输出目录（覆盖 --vault 下的默认目录）
@@ -22,6 +23,9 @@
     --no-img        不下载图片，仅保留原文图片链接
     --overwrite     已存在同名文件时覆盖原文件，而非生成 _1.md 副本
     --dry-run       只分析不下载/不写文件，打印预计结果（标题/日期/图片数）
+    --album         把「公众号合集/专辑」整本抓取下来（支持合集URL 或 album_id）
+    --album-biz BIZ 配合 --album 使用 album_id 时，需同时给出 __biz
+    --list-only     仅列出合集/单篇的待处理清单（URL+标题），不抓取正文
 """
 
 import sys
@@ -73,7 +77,7 @@ IMAGE_PREFIX = "wechat"
 REQUEST_TIMEOUT = 30
 DOWNLOAD_RETRIES = 2
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -765,6 +769,139 @@ def is_wechat_url(url: str) -> bool:
             or host == 'weixin.qq.com')
 
 
+# --------------------------------------------------------------------------- #
+# 合集（专辑）解析
+# --------------------------------------------------------------------------- #
+ALBUM_COUNT_PER_PAGE = 10   # 微信合集接口单页上限，硬编码在服务端
+ALBUM_MAX_PAGES = 100       # 翻页安全上限，防止游标异常导致死循环
+
+
+def parse_album_target(target: str, biz: str = ''):
+    """从合集 URL 或裸 album_id 解析出 (biz, album_id)。
+
+    支持三种输入：
+      1. 完整合集 URL：https://mp.weixin.qq.com/mp/appmsgalbum?...__biz=X&album_id=Y
+      2. 裸 album_id（需同时通过 biz 参数给出 __biz）
+      3. 短链/带 fragment 的合集 URL（#wechat_redirect 之类会被忽略）
+
+    返回 (biz, album_id)；解析失败相应字段为空串。
+    """
+    target = (target or '').strip()
+    if not target:
+        return '', ''
+    if 'mp.weixin.qq.com' in target or target.startswith('http'):
+        try:
+            qs = parse_qs(urlparse(target).query)
+        except Exception:
+            return biz, ''
+        got_biz = (qs.get('__biz') or [''])[0]
+        got_album = (qs.get('album_id') or [''])[0]
+        return (got_biz or biz), got_album
+    # 裸 album_id
+    return biz, target
+
+
+def _album_api_url(biz: str, album_id: str, begin=None, count: int = ALBUM_COUNT_PER_PAGE) -> str:
+    """构造合集 JSON 接口 URL。
+
+    翻页协议（逆向自 album81568d.js，勿随意改动参数名）：
+      * action=getalbum&__biz=<biz>&album_id=<id>&count=N&f=json
+      * 翻下一页：begin_msgid=<上一页最后一条 msgid>&begin_itemidx=<其 itemidx>
+      * 必须带 f=json，否则返回 HTML
+    无效参数（实测翻页无效）：pageidx / from_msgid / begin
+    """
+    url = (f"https://mp.weixin.qq.com/mp/appmsgalbum?action=getalbum"
+           f"&__biz={biz}&album_id={album_id}&count={count}&f=json")
+    if begin:
+        url += f"&begin_msgid={begin[0]}&begin_itemidx={begin[1]}"
+    return url
+
+
+def _album_fetch_page(url: str, settings) -> dict:
+    """拉取一页合集数据，返回 getalbum_resp 字典；失败返回空字典（含重试）。"""
+    headers = {
+        'User-Agent': UA,
+        'Accept': 'application/json,text/plain,*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    }
+    for attempt in range(1 + settings['download_retries']):
+        try:
+            r = _session().get(url, headers=headers, timeout=settings['request_timeout'])
+            body = (r.text or '').lstrip()
+            if body.startswith('{'):
+                data = json.loads(body)
+                return data.get('getalbum_resp') or {}
+        except Exception:
+            pass
+        if attempt < settings['download_retries']:
+            time.sleep(2 ** attempt)
+    return {}
+
+
+def fetch_album_items(album_target: str, settings, biz: str = '') -> dict:
+    """抓取整个合集的全部文章条目（游标翻页直到 continue_flag==0）。
+
+    返回 dict：
+      {'items': [{'n','title','url','msgid','itemidx','create_time'}...],
+       'error': None 或 错误说明,
+       'album_title': 合集名}
+    """
+    biz, album_id = parse_album_target(album_target, biz)
+    if not album_id:
+        return {'items': [], 'error': '无法从输入解析出 album_id，请给出合集完整 URL 或 --album <album_id> + --album-biz <__biz>', 'album_title': ''}
+    if not biz:
+        return {'items': [], 'error': '缺少 __biz，请在合集 URL 中保留 __biz 参数，或用 --album-biz <__biz> 指定', 'album_title': ''}
+
+    items = []
+    seen = set()
+    cursor = None
+    album_title = ''
+    first_page = True
+
+    for page_no in range(ALBUM_MAX_PAGES):
+        resp = _album_fetch_page(_album_api_url(biz, album_id, cursor), settings)
+        if not resp:
+            if first_page:
+                return {'items': [], 'error': '合集接口无响应（可能链接失效、合集已删除，或被风控拦截）', 'album_title': ''}
+            break  # 中途失败：保留已抓到的部分
+        lst = resp.get('article_list') or []
+        if isinstance(lst, dict):   # 单条时接口可能返回对象而非数组
+            lst = [lst]
+        if not lst:
+            break
+        if first_page:
+            base_info = resp.get('base_info') or {}
+            album_title = (base_info.get('title') or '').strip()
+            first_page = False
+
+        new_cnt = 0
+        for it in lst:
+            key = (it.get('msgid'), it.get('itemidx'))
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                'n': len(items) + 1,
+                'title': (it.get('title') or '').strip(),
+                'url': (it.get('url') or '').replace('&amp;', '&'),
+                'msgid': it.get('msgid'),
+                'itemidx': it.get('itemidx'),
+                'create_time': it.get('create_time') or '',
+            })
+            new_cnt += 1
+
+        last = lst[-1]
+        cursor = (last.get('msgid'), last.get('itemidx'))
+        # continue_flag == 0 表示没有下一页；无新增也视为结束，避免死循环
+        if str(resp.get('continue_flag', '0')) == '0' or new_cnt == 0:
+            break
+        time.sleep(0.6)  # 轻微限速，降低被风控概率
+
+    if not items:
+        return {'items': [], 'error': '合集解析成功但未取到任何文章', 'album_title': album_title}
+    return {'items': items, 'error': None, 'album_title': album_title}
+
+
 def _fetch_article(url, settings):
     """抓取文章，返回 (soup, title, pub_date, content, error)。
 
@@ -867,6 +1004,68 @@ def process_note(url, settings, vault='', obsidian_mode=False, out_dir=None,
     return result
 
 
+def process_album(album_target, settings, vault='', obsidian_mode=False, out_dir=None,
+                  download_images=True, overwrite=False, dry_run=False, biz='', progress=True):
+    """整本抓取合集：先解析全部文章链接，再逐篇转换落盘。
+
+    返回 dict：
+      {'album_title','total','ok':[...],'fail':[...],'error':None,
+       'img_ok':N,'img_fail':N,'index_path':路径或None}
+    ok 每项：{'n','title','path','img_ok','img_fail'}
+    fail 每项：{'n','title','url','error'}
+    """
+    meta = fetch_album_items(album_target, settings, biz=biz)
+    res = {'album_title': meta.get('album_title') or '', 'total': 0,
+           'ok': [], 'fail': [], 'error': meta.get('error'),
+           'img_ok': 0, 'img_fail': 0, 'index_path': None}
+    if res['error']:
+        return res
+
+    items = meta['items']
+    res['total'] = len(items)
+    if progress:
+        print(f"合集：{res['album_title'] or '(未命名)'}  共 {len(items)} 篇")
+
+    base = Path(out_dir) if out_dir else (Path(vault) / settings['wechat_folder'])
+
+    for it in items:
+        # 复用单篇逻辑，保证正文/图片/frontmatter 行为完全一致
+        r = process_note(it['url'], settings, vault, obsidian_mode, out_dir,
+                         download_images, overwrite, dry_run)
+        if r.get('error'):
+            res['fail'].append({'n': it['n'], 'title': it['title'],
+                                'url': it['url'], 'error': r['error']})
+            if progress:
+                print(f"[{it['n']:>3}/{len(items)}] ❌ {it['title'][:40]} :: {r['error'][:60]}")
+            continue
+        res['ok'].append({'n': it['n'], 'title': r.get('title') or it['title'],
+                          'path': r.get('path'), 'img_ok': r.get('img_ok', 0),
+                          'img_fail': r.get('img_fail', 0)})
+        res['img_ok'] += r.get('img_ok', 0)
+        res['img_fail'] += r.get('img_fail', 0)
+        if progress:
+            tag = '预计' if dry_run else '✅'
+            print(f"[{it['n']:>3}/{len(items)}] {tag} {(r.get('title') or it['title'])[:40]}")
+        time.sleep(0.4)  # 篇间限速，降低风控概率
+
+    # 生成链接清单，便于日后单篇重取或核对
+    if not dry_run and res['ok']:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            idx_name = sanitize_filename(f"_合集链接-{res['album_title'] or '合集'}") + '.md'
+            idx_path = base / idx_name
+            lines = [f"# {res['album_title'] or '合集'} - 链接清单（{len(res['ok'])} 篇）", '',
+                     f"抓取时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}", '']
+            for o in sorted(res['ok'], key=lambda x: x['n']):
+                lines.append(f"{o['n']}. [[{sanitize_filename(o['title'])}]]")
+            idx_path.write_text('\n'.join(lines), encoding='utf-8')
+            res['index_path'] = str(idx_path)
+        except Exception:
+            pass  # 清单生成失败不影响正文结果
+
+    return res
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='wechat_to_obsidian.py',
@@ -880,10 +1079,13 @@ def main():
     parser.add_argument('--no-img', action='store_true', help='不下载图片，仅保留原文图片链接')
     parser.add_argument('--overwrite', action='store_true', help='已存在同名文件时覆盖，而非生成 _1.md 副本')
     parser.add_argument('--dry-run', action='store_true', help='只分析不下载/不写文件，打印预计结果')
+    parser.add_argument('--album', help='抓取整本合集/专辑：传合集 URL 或 album_id')
+    parser.add_argument('--album-biz', default='', help='配合 --album 传未含 __biz 的 album_id 时使用')
+    parser.add_argument('--list-only', action='store_true', help='仅列出待处理清单(URL+标题)，不抓正文')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     args = parser.parse_args()
 
-    if not args.url:
+    if not args.url and not args.album:
         parser.print_help()
         sys.exit(1)
 
@@ -899,6 +1101,37 @@ def main():
         print("请在 config/settings.json 设置 \"vault\"，或用 --vault <目录> 指定，或用 --out <目录> 直接指定输出位置。")
         sys.exit(1)
 
+    # ---------- 合集模式 ----------
+    if args.album:
+        if args.list_only:
+            meta = fetch_album_items(args.album, settings, biz=args.album_biz)
+            if meta.get('error'):
+                print(f"失败：{meta['error']}")
+                sys.exit(1)
+            print(f"合集：{meta.get('album_title') or '(未命名)'}  共 {len(meta['items'])} 篇")
+            for it in meta['items']:
+                print(f"{it['n']}. {it['title']}")
+                print(f"   {it['url']}")
+            return
+        res = process_album(args.album, settings, vault, obsidian_mode, out_dir,
+                            download_images, overwrite=args.overwrite,
+                            dry_run=args.dry_run, biz=args.album_biz)
+        if res['error']:
+            print(f"失败：{res['error']}")
+            sys.exit(1)
+        print(f"\n===== 合集完成：{res['album_title'] or '(未命名)'} =====")
+        print(f"成功 {len(res['ok'])} / 失败 {len(res['fail'])} / 共 {res['total']} 篇")
+        if download_images and not args.dry_run:
+            print(f"图片：成功 {res['img_ok']} 张，失败 {res['img_fail']} 张")
+        if res['index_path']:
+            print(f"链接清单：{res['index_path']}")
+        for f in res['fail']:
+            print(f"  ❌ {f['n']}. {f['title'][:40]} :: {f['error'][:70]}")
+        if res['fail']:
+            sys.exit(1)
+        return
+
+    # ---------- 单篇模式 ----------
     if not is_wechat_url(args.url):
         print(f"警告：链接非微信公众号域名（{args.url}），仍尝试抓取。")
 

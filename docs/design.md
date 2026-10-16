@@ -41,6 +41,32 @@ wechat-to-obsidian/
   - `image_prefix` 图片名前缀；`obsidian_wikilink` 是否用 `![[...]]`
   - `download_images` 是否下载图片；`request_timeout` 请求超时；`download_retries` 图片重试次数
 
+## 合集（专辑）抓取设计
+单篇文章走 `process_note()`；整本合集走 `process_album()`，分层如下：
+
+- `parse_album_target(target, biz)`：解析入参 → `(biz, album_id)`。兼容完整合集 URL、裸 `album_id`、带 `#wechat_redirect` 的链接。
+- `_album_api_url(biz, album_id, begin, count)`：**唯一**构造合集接口 URL 的地方，参数名硬编码并加注释保护。
+- `_album_fetch_page(url, settings)`：拉取单页 JSON，带重试；非 JSON（被风控返回 HTML）视为失败。
+- `fetch_album_items(...)`：游标翻页，直到 `continue_flag == 0` 或无新增条目。
+- `process_album(...)`：先取全量条目，再**逐篇复用 `process_note()`** 落盘，保证正文/图片/frontmatter 行为与单篇完全一致，避免两套转换逻辑漂移。
+
+翻页协议（逆向自 `album81568d.js`，**勿改参数名**）：
+
+```
+/mp/appmsgalbum?action=getalbum&__biz=<biz>&album_id=<id>&count=10&f=json
+  [&begin_msgid=<上页末条msgid>&begin_itemidx=<其itemidx>]
+```
+
+- 必须带 `f=json`，否则返回 HTML。
+- 翻页靠游标而非页码：`pageidx` / `from_msgid` / `begin` 实测均**无效**（永远返回首页）。
+- 终止条件：`getalbum_resp.continue_flag == 0`。
+
+安全阀与容错：
+- `ALBUM_MAX_PAGES=100` 上限，防止游标异常导致死循环；「本页无新增条目」也立即停止。
+- 页间 `sleep 0.6s`、篇间 `sleep 0.4s` 限速，降低风控概率。
+- 中途失败保留已抓到的条目；单篇失败不中断整本，计入 `fail` 列表。
+- 完成后生成 `_合集链接-<合集名>.md`（wikilink 清单），生成失败不影响正文。
+
 ## 依赖
 需要 Python 3.8+ 与 `requests`、`beautifulsoup4`（见仓库根 `requirements.txt`，首次使用 `pip install -r requirements.txt`）。
 

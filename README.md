@@ -14,6 +14,7 @@
 - 微信 LaTeX 公式（`<span data-formula>`）包裹为 `$公式$`，可在 Obsidian / MathJax 中渲染
 - 支持 Obsidian wikilink 图片格式（`![[图片名]]`，通过 `--obsidian` 或配置开启）
 - 支持 `--dry-run` 预检（只分析不下载/不写文件，打印预计标题/日期/图片数）；非微信域名链接会给出提示
+- 支持整本抓取公众号「合集 / 专辑」（`--album`），游标翻页取全量，并生成链接清单
 - 自动压缩多余空行、列表渲染为紧凑形态，输出整洁
 
 ## 目录结构
@@ -154,7 +155,28 @@ python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
 - `--no-img`：不下载图片，仅保留原文图片链接
 - `--overwrite`：已存在同名文件时覆盖，而非生成 `_1.md` 副本
 - `--dry-run`：只分析不下载/不写文件，打印预计标题/日期/图片数
+- `--album URL|ID`：抓取整本合集/专辑（支持合集 URL 或裸 `album_id`）
+- `--album-biz BIZ`：`--album` 传裸 `album_id` 时，配套指定 `__biz`
+- `--list-only`：仅列出合集清单（URL + 标题），不抓取正文
 - `--version`：显示版本号
+
+### 抓取整本合集 / 专辑
+
+公众号「合集」（专辑）页 `appmsgalbum` 只在前端渲染前 10 篇，翻页靠游标接口。用 `--album` 可一次抓完整本：
+
+```bash
+# 1. 先看清单，确认篇数与标题
+python scripts/wechat_to_obsidian.py --album "https://mp.weixin.qq.com/mp/appmsgalbum?__biz=XXX&action=getalbum&album_id=YYY" --list-only
+
+# 2. 正式抓取（逐篇落盘，图片一并本地化）
+python scripts/wechat_to_obsidian.py --album "https://mp.weixin.qq.com/mp/appmsgalbum?__biz=XXX&album_id=YYY"
+
+# 只有 album_id 时补 __biz
+python scripts/wechat_to_obsidian.py --album "YYY" --album-biz "XXX"
+```
+
+完成后除各篇文章外，还会在输出目录生成一份 `_合集链接-<合集名>.md` 链接清单（含 wikilink），方便日后单篇重取。
+合集模式为逐篇串行抓取（含限速），篇数多时耗时较长属正常；单篇失败不会中断整本，脚本结尾汇总成功/失败数与失败项。
 
 ## 输出示例
 
