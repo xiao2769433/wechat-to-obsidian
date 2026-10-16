@@ -801,6 +801,106 @@ class TestProcessAlbum(unittest.TestCase):
         self.assertIsNone(r['index_path'])          # 不生成清单
         self.assertEqual(list(Path(d).glob('*.md')), [])
 
+    # ---------- --resume 断点续抓（F4） ----------
+
+    def _pages(self):
+        return [{'title': f'T{i}', 'msgid': str(i), 'itemidx': '1',
+                 'url': f'http://mp.weixin.qq.com/s?__biz=B&mid={i}'}
+                for i in (11, 12, 13)]
+
+    def test_resume_skips_existing(self):
+        """已存在的文章应跳过，且不发起抓取（不调用文章请求）。"""
+        pages = self._pages()
+        album_txt = json_mod.dumps({
+            'base_resp': {'ret': 0},
+            'getalbum_resp': {'article_list': pages, 'continue_flag': '0',
+                              'base_info': {'title': 'C'}},
+        })
+        article_hits = []
+
+        class Resp:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.content = b''
+                self.encoding = None
+
+            def raise_for_status(self):
+                pass
+
+        class Sess:
+            def get(self, url, **k):
+                if 'action=getalbum' in url:
+                    return Resp(album_txt)
+                article_hits.append(url)
+                mm = re.search(r'mid=(\d+)', url)
+                return Resp(f'<html><head><meta property="og:title" '
+                            f'content="T{mm.group(1)}"></head><body>'
+                            f'<div class="rich_media_content"><p>x</p>'
+                            f'</div></body></html>')
+
+        settings = {'image_prefix': 'wechat', 'request_timeout': 30,
+                    'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: Sess()):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                with tempfile.TemporaryDirectory() as d:
+                    # 预置第 1 篇已存
+                    (Path(d) / (w.sanitize_filename('T11') + '.md')).write_text(
+                        'placeholder', encoding='utf-8')
+                    r = w.process_album('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM',
+                                        settings, vault='', out_dir=d,
+                                        download_images=False, progress=False,
+                                        resume=True)
+                    self.assertIsNone(r['error'])
+                    self.assertEqual(len(r['skipped']), 1)
+                    self.assertEqual(r['skipped'][0]['title'], 'T11')
+                    self.assertEqual(len(r['ok']), 2)
+                    # 只对未存的两篇发起抓取
+                    self.assertEqual(len(article_hits), 2)
+                    # 清单须覆盖全部 3 篇（含跳过项）
+                    idx = Path(r['index_path']).read_text(encoding='utf-8')
+                    self.assertEqual(idx.count('[['), 3)
+
+    def test_resume_off_fetches_all(self):
+        """未开 resume 时不跳过，全部重新抓取。"""
+        pages = self._pages()
+        settings = {'image_prefix': 'wechat', 'request_timeout': 30,
+                    'download_retries': 0}
+        with mock.patch.object(w, '_session', lambda: self._sessions(pages)):
+            with mock.patch.object(w.time, 'sleep', lambda *a: None):
+                with tempfile.TemporaryDirectory() as d:
+                    (Path(d) / (w.sanitize_filename('T11') + '.md')).write_text(
+                        'placeholder', encoding='utf-8')
+                    r = w.process_album('https://mp.weixin.qq.com/mp/appmsgalbum'
+                                        '?__biz=BIZ&album_id=ALBUM',
+                                        settings, vault='', out_dir=d,
+                                        download_images=False, progress=False,
+                                        resume=False)
+                    self.assertEqual(r['skipped'], [])
+                    self.assertEqual(len(r['ok']), 3)
+
+    def test_resume_matches_numbered_duplicate(self):
+        """重名副本 _1.md 也应视为已存。"""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / (w.sanitize_filename('T11') + '_1.md')).write_text(
+                'x', encoding='utf-8')
+            self.assertTrue(w._is_article_saved(Path(d), 'T11'))
+
+    def test_is_article_saved_rejects_unrelated(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'T110.md').write_text('x', encoding='utf-8')
+            self.assertFalse(w._is_article_saved(Path(d), 'T11'))
+            (Path(d) / 'Other.md').write_text('x', encoding='utf-8')
+            self.assertFalse(w._is_article_saved(Path(d), 'T11'))
+
+    def test_is_article_saved_handles_blank_title(self):
+        """标题清洗后为空/占位时不应误判为已存。"""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'article.md').write_text('x', encoding='utf-8')
+            self.assertFalse(w._is_article_saved(Path(d), '???'))
+            self.assertFalse(w._is_article_saved(Path(d), ''))
+
 
 @skip_no_deps
 class TestFetchArticle(unittest.TestCase):

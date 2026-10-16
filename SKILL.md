@@ -20,10 +20,11 @@ python scripts/wechat_to_obsidian.py --album "<合集URL>"
 - 合集 URL 里必须带 `__biz`；若只有 `album_id`，补 `--album-biz <__biz>`
 - 建议先 `--list-only` 确认篇数与清单，再正式执行
 - 结束后额外生成链接清单 `_合集链接-<合集名>.md`（含 wikilink）
+- 中断后重跑加 `--resume`：跳过输出目录中已存在的文章，不重复抓取/下载
 
 **通用选项**：
 - 输出目录：默认 `<vault>/<wechat_folder>/`（见 `config/settings.json`）；用户指定别的目录用 `--out <绝对路径>`（图片进 `<out>/images/`）。`vault` 未配置时必须用 `--vault` 或 `--out` 指定。
-- `--out` `--vault` `--obsidian`（wikilink）`--no-img` `--overwrite` `--dry-run` `--album` `--album-biz` `--list-only` `--version`
+- `--out` `--vault` `--obsidian`（wikilink）`--no-img` `--overwrite` `--dry-run` `--album` `--album-biz` `--list-only` `--resume` `--version`
 
 ## 合集抓取要点（勿改坏）
 微信合集接口翻页靠**游标**，不是页码。逆向自 `album81568d.js`：

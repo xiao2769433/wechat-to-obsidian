@@ -158,6 +158,7 @@ python scripts/wechat_to_obsidian.py "https://mp.weixin.qq.com/s/xxxxx"
 - `--album URL|ID`：抓取整本合集/专辑（支持合集 URL 或裸 `album_id`）
 - `--album-biz BIZ`：`--album` 传裸 `album_id` 时，配套指定 `__biz`
 - `--list-only`：仅列出合集清单（URL + 标题），不抓取正文
+- `--resume`：合集续抓，跳过输出目录中已存在的文章（断点续抓）
 - `--version`：显示版本号
 
 ### 抓取整本合集 / 专辑
@@ -173,10 +174,15 @@ python scripts/wechat_to_obsidian.py --album "https://mp.weixin.qq.com/mp/appmsg
 
 # 只有 album_id 时补 __biz
 python scripts/wechat_to_obsidian.py --album "YYY" --album-biz "XXX"
+
+# 中断后继续：跳过已存在的文章，只抓缺的
+python scripts/wechat_to_obsidian.py --album "https://mp.weixin.qq.com/mp/appmsgalbum?__biz=XXX&album_id=YYY" --resume
 ```
 
 完成后除各篇文章外，还会在输出目录生成一份 `_合集链接-<合集名>.md` 链接清单（含 wikilink），方便日后单篇重取。
 合集模式为逐篇串行抓取（含限速），篇数多时耗时较长属正常；单篇失败不会中断整本，脚本结尾汇总成功/失败数与失败项。
+
+`--resume` 按「输出目录中是否已存在同名 `.md`」判断，已存在则直接跳过该篇（不发起网络请求、不重下图片）。续抓生成的清单会覆盖整本（含跳过的篇目），不会因跳过而残缺。若想强制重抓全部，去掉 `--resume`；若想覆盖同一篇，加 `--overwrite`。
 
 ## 输出示例
 

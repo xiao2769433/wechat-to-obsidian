@@ -67,6 +67,12 @@ wechat-to-obsidian/
 - 中途失败保留已抓到的条目；单篇失败不中断整本，计入 `fail` 列表。
 - 完成后生成 `_合集链接-<合集名>.md`（wikilink 清单），生成失败不影响正文。
 
+断点续抓（`--resume`）：
+- `_is_article_saved(base, title)` 按「输出目录是否已有 `<清洗标题>.md`」判定，同时匹配重名副本 `<清洗标题>_N.md`。
+- 判定发生在**抓取之前**，命中则整篇跳过，不发起文章请求、不下载图片，被跳过项计入 `skipped`（不计 ok/fail）。
+- 清单生成时把 `skipped` 与 `ok` 合并排序，保证续抓后的清单仍覆盖整本，不会因跳过而残缺。
+- 与 `--overwrite` 互斥生效：`--resume --overwrite` 时以覆盖为准（不跳过）。
+
 ## 依赖
 需要 Python 3.8+ 与 `requests`、`beautifulsoup4`（见仓库根 `requirements.txt`，首次使用 `pip install -r requirements.txt`）。
 

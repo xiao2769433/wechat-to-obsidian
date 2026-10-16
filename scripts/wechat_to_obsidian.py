@@ -26,6 +26,7 @@
     --album         把「公众号合集/专辑」整本抓取下来（支持合集URL 或 album_id）
     --album-biz BIZ 配合 --album 使用 album_id 时，需同时给出 __biz
     --list-only     仅列出合集/单篇的待处理清单（URL+标题），不抓取正文
+    --resume        合集续抓：跳过输出目录中已存在的文章（断点续抓）
 """
 
 import sys
@@ -1004,19 +1005,51 @@ def process_note(url, settings, vault='', obsidian_mode=False, out_dir=None,
     return result
 
 
+def album_index_path(base: Path, album_title: str) -> Path:
+    """合集链接清单的路径（与 process_album 生成时保持一致）。"""
+    return Path(base) / (sanitize_filename(f"_合集链接-{album_title or '合集'}") + '.md')
+
+
+def _is_article_saved(base: Path, title: str) -> bool:
+    """判断某篇文章是否已在输出目录落盘（供 --resume 跳过已存项）。
+
+    同时匹配主文件名与 `_N` 副本（脚本遇重名会追加数字），
+    以及已被 sanitize 的标题变体。
+    """
+    stem = sanitize_filename(title)
+    if not stem or stem == 'article':
+        return False
+    for cand in (base / f'{stem}.md', ):
+        if cand.exists():
+            return True
+    # 重名副本：<stem>_1.md / <stem>_2.md …
+    try:
+        for p in base.glob(f'{stem}_*.md'):
+            if re.fullmatch(re.escape(stem) + r'_\d+\.md', p.name):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def process_album(album_target, settings, vault='', obsidian_mode=False, out_dir=None,
-                  download_images=True, overwrite=False, dry_run=False, biz='', progress=True):
+                  download_images=True, overwrite=False, dry_run=False, biz='', progress=True,
+                  resume=False):
     """整本抓取合集：先解析全部文章链接，再逐篇转换落盘。
 
+    resume=True 时跳过输出目录中已存在的文章（断点续抓），
+    被跳过项计入 skipped，不计入 ok/fail，也不发起网络请求。
+
     返回 dict：
-      {'album_title','total','ok':[...],'fail':[...],'error':None,
+      {'album_title','total','ok':[...],'fail':[...],'skipped':[...],'error':None,
        'img_ok':N,'img_fail':N,'index_path':路径或None}
     ok 每项：{'n','title','path','img_ok','img_fail'}
     fail 每项：{'n','title','url','error'}
+    skipped 每项：{'n','title'}
     """
     meta = fetch_album_items(album_target, settings, biz=biz)
     res = {'album_title': meta.get('album_title') or '', 'total': 0,
-           'ok': [], 'fail': [], 'error': meta.get('error'),
+           'ok': [], 'fail': [], 'skipped': [], 'error': meta.get('error'),
            'img_ok': 0, 'img_fail': 0, 'index_path': None}
     if res['error']:
         return res
@@ -1025,10 +1058,18 @@ def process_album(album_target, settings, vault='', obsidian_mode=False, out_dir
     res['total'] = len(items)
     if progress:
         print(f"合集：{res['album_title'] or '(未命名)'}  共 {len(items)} 篇")
+        if resume:
+            print("续抓模式：跳过输出目录中已存在的文章")
 
     base = Path(out_dir) if out_dir else (Path(vault) / settings['wechat_folder'])
 
     for it in items:
+        # --resume：已落盘则跳过（不抓正文、不下载图片，省时省流量）
+        if resume and not overwrite and _is_article_saved(base, it['title']):
+            res['skipped'].append({'n': it['n'], 'title': it['title']})
+            if progress:
+                print(f"[{it['n']:>3}/{len(items)}] ⏭  已存在，跳过 {it['title'][:34]}")
+            continue
         # 复用单篇逻辑，保证正文/图片/frontmatter 行为完全一致
         r = process_note(it['url'], settings, vault, obsidian_mode, out_dir,
                          download_images, overwrite, dry_run)
@@ -1048,15 +1089,16 @@ def process_album(album_target, settings, vault='', obsidian_mode=False, out_dir
             print(f"[{it['n']:>3}/{len(items)}] {tag} {(r.get('title') or it['title'])[:40]}")
         time.sleep(0.4)  # 篇间限速，降低风控概率
 
-    # 生成链接清单，便于日后单篇重取或核对
-    if not dry_run and res['ok']:
+    # 生成链接清单，便于日后单篇重取或核对。
+    # 续抓场景下清单需覆盖整本（含本次跳过项），否则清单会残缺。
+    listed = res['ok'] + [{'n': s['n'], 'title': s['title']} for s in res['skipped']]
+    if not dry_run and listed:
         try:
             base.mkdir(parents=True, exist_ok=True)
-            idx_name = sanitize_filename(f"_合集链接-{res['album_title'] or '合集'}") + '.md'
-            idx_path = base / idx_name
-            lines = [f"# {res['album_title'] or '合集'} - 链接清单（{len(res['ok'])} 篇）", '',
+            idx_path = album_index_path(base, res['album_title'])
+            lines = [f"# {res['album_title'] or '合集'} - 链接清单（{len(listed)} 篇）", '',
                      f"抓取时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}", '']
-            for o in sorted(res['ok'], key=lambda x: x['n']):
+            for o in sorted(listed, key=lambda x: x['n']):
                 lines.append(f"{o['n']}. [[{sanitize_filename(o['title'])}]]")
             idx_path.write_text('\n'.join(lines), encoding='utf-8')
             res['index_path'] = str(idx_path)
@@ -1082,6 +1124,8 @@ def main():
     parser.add_argument('--album', help='抓取整本合集/专辑：传合集 URL 或 album_id')
     parser.add_argument('--album-biz', default='', help='配合 --album 传未含 __biz 的 album_id 时使用')
     parser.add_argument('--list-only', action='store_true', help='仅列出待处理清单(URL+标题)，不抓正文')
+    parser.add_argument('--resume', action='store_true',
+                        help='合集续抓：跳过输出目录中已存在的文章（断点续抓）')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     args = parser.parse_args()
 
@@ -1115,12 +1159,14 @@ def main():
             return
         res = process_album(args.album, settings, vault, obsidian_mode, out_dir,
                             download_images, overwrite=args.overwrite,
-                            dry_run=args.dry_run, biz=args.album_biz)
+                            dry_run=args.dry_run, biz=args.album_biz,
+                            resume=args.resume)
         if res['error']:
             print(f"失败：{res['error']}")
             sys.exit(1)
         print(f"\n===== 合集完成：{res['album_title'] or '(未命名)'} =====")
-        print(f"成功 {len(res['ok'])} / 失败 {len(res['fail'])} / 共 {res['total']} 篇")
+        print(f"成功 {len(res['ok'])} / 失败 {len(res['fail'])}"
+              f" / 跳过 {len(res['skipped'])} / 共 {res['total']} 篇")
         if download_images and not args.dry_run:
             print(f"图片：成功 {res['img_ok']} 张，失败 {res['img_fail']} 张")
         if res['index_path']:
